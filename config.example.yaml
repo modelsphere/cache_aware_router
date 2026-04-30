@@ -1,0 +1,47 @@
+# Cache-Aware Router Configuration
+# Only 'workers' is required. All other fields show their defaults.
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+  request_timeout_secs: 300
+
+# Backend vLLM worker URLs (required, at least one)
+workers:
+  - url: "http://node1:8050"
+    max_load: 20
+  - url: "http://node2:8050"
+    max_load: 20
+
+cache:
+  # Minimum prefix match ratio to use cache-affinity routing (0.0-1.0)
+  threshold: 0.3
+  # Absolute load difference threshold for imbalance detection
+  balance_abs_threshold: 5
+  # Relative load ratio threshold for imbalance detection
+  balance_rel_threshold: 1.6
+  # LRU eviction interval in seconds (0 to disable)
+  eviction_interval_secs: 60
+  # Maximum nodes per radix tree before eviction
+  max_tree_size: 2097152
+
+health:
+  endpoint: "/health"
+  interval_secs: 10
+  failure_threshold: 3
+  success_threshold: 1
+
+retry:
+  max_retries: 3
+  initial_backoff_ms: 100
+  max_backoff_ms: 5000
+  backoff_multiplier: 2.0
+  jitter_factor: 0.25
+
+circuit_breaker:
+  failure_threshold: 5
+  success_threshold: 2
+  timeout_secs: 30
+
+logging:
+  level: "info"
