@@ -96,8 +96,7 @@ async fn main() {
     let state = AppState {
         client,
         router: Arc::clone(&cache_router),
-        retry_config: config.retry_config(),
-        request_timeout: config.request_timeout(),
+        proxy_config: config.proxy_config(),
     };
 
     // Spawn SIGHUP reload handler

@@ -1,4 +1,4 @@
-use crate::config::RetryConfig;
+use crate::config::ProxyConfig;
 use crate::metrics;
 use crate::routing::CacheRouter;
 use crate::worker::{LoadGuard, Worker};
@@ -54,7 +54,7 @@ fn is_retryable_status(status: StatusCode) -> bool {
 }
 
 /// Calculate exponential backoff with jitter
-fn backoff_delay(config: &RetryConfig, attempt: u32) -> Duration {
+fn backoff_delay(config: &ProxyConfig, attempt: u32) -> Duration {
     let base = config.initial_backoff_ms as f32 * config.backoff_multiplier.powi(attempt as i32);
     let capped = (base as u64).min(config.max_backoff_ms);
 
@@ -239,18 +239,18 @@ pub async fn proxy_request(
     method: &reqwest::Method,
     body: Bytes,
     headers: &HeaderMap,
-    retry_config: &RetryConfig,
-    timeout: Duration,
+    proxy_config: &ProxyConfig,
 ) -> Response {
     let request_text = extract_request_text(&body, path);
     let start = Instant::now();
 
-    let max_attempts = retry_config.max_retries.max(1);
+    let max_attempts = proxy_config.max_retries.max(1);
     let mut last_response: Option<Response> = None;
+    let mut last_failed: Option<usize> = None;
 
     for attempt in 0..max_attempts {
-        // Select a worker
-        let worker_idx = match router.select_worker(&request_text) {
+        // Select a worker, excluding the one that just failed
+        let worker_idx = match router.select_worker(&request_text, last_failed) {
             Some(idx) => idx,
             None => {
                 warn!("No available workers for request to {}", path);
@@ -263,7 +263,16 @@ pub async fn proxy_request(
         // RAII guard: load is decremented when guard is dropped (including on cancellation)
         let guard = LoadGuard::new(Arc::clone(&worker));
 
-        let result = forward_to_worker(client, &worker, path, method, body.clone(), headers, timeout).await;
+        let result = forward_to_worker(
+            client,
+            &worker,
+            path,
+            method,
+            body.clone(),
+            headers,
+            Duration::from_secs(proxy_config.request_timeout_secs),
+        )
+        .await;
 
         match result {
             Ok(response) => {
@@ -275,13 +284,14 @@ pub async fn proxy_request(
                 if is_retryable_status(status) && attempt + 1 < max_attempts {
                     // Guard drops here → load decremented automatically
                     drop(guard);
+                    last_failed = Some(worker_idx);
                     metrics::record_retry(attempt);
                     warn!(
                         "{} → {} retryable error status={} attempt={}/{}, retrying",
                         path, worker.url(), status.as_u16(), attempt + 1, max_attempts
                     );
 
-                    let delay = backoff_delay(retry_config, attempt);
+                    let delay = backoff_delay(proxy_config, attempt);
                     tokio::time::sleep(delay).await;
 
                     last_response = Some(response);
@@ -295,26 +305,29 @@ pub async fn proxy_request(
                     );
                 }
 
-                if is_streaming_sse(&response) {
-                    // Transfer load ownership from guard to stream wrapper
-                    let worker_arc = guard.disarm();
+                router.record_routed(worker_idx, &request_text);
+                metrics::record_request_duration(worker.url(), start.elapsed());
 
+                let mut response = if is_streaming_sse(&response) {
+                    // Streaming: transfer load ownership to stream wrapper
+                    let worker_arc = guard.disarm();
                     let (parts, body) = response.into_parts();
                     let tracking_stream = LoadTrackingStream {
                         inner: body.into_data_stream(),
                         worker: Some(worker_arc),
                     };
-                    let response = Response::from_parts(parts, Body::from_stream(tracking_stream));
+                    Response::from_parts(parts, Body::from_stream(tracking_stream))
+                } else {
+                    // Non-streaming: guard drops → load decremented automatically
+                    response
+                };
 
-                    router.record_routed(worker_idx, &request_text);
-                    metrics::record_request_duration(worker.url(), start.elapsed());
-
-                    return response;
+                if proxy_config.add_routed_peer_header {
+                    response.headers_mut().insert(
+                        "x-routed-peer",
+                        worker.url().parse().unwrap_or_else(|_| "invalid".parse().unwrap()),
+                    );
                 }
-
-                // Non-streaming: guard drops here → load decremented automatically
-                router.record_routed(worker_idx, &request_text);
-                metrics::record_request_duration(worker.url(), start.elapsed());
 
                 return response;
             }
@@ -324,13 +337,14 @@ pub async fn proxy_request(
 
                 if attempt + 1 < max_attempts {
                     drop(guard);
+                    last_failed = Some(worker_idx);
                     metrics::record_retry(attempt);
                     warn!(
                         "{} → {} connection error status={} attempt={}/{}, retrying",
                         path, worker.url(), status.as_u16(), attempt + 1, max_attempts
                     );
 
-                    let delay = backoff_delay(retry_config, attempt);
+                    let delay = backoff_delay(proxy_config, attempt);
                     tokio::time::sleep(delay).await;
 
                     continue;

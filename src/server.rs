@@ -1,4 +1,4 @@
-use crate::config::RetryConfig;
+use crate::config::ProxyConfig;
 use crate::proxy;
 use crate::routing::CacheRouter;
 use arc_swap::ArcSwap;
@@ -10,14 +10,12 @@ use axum::routing::{get, post};
 use axum::Router;
 use serde_json::json;
 use std::sync::Arc;
-use std::time::Duration;
 
 #[derive(Clone)]
 pub struct AppState {
     pub client: reqwest::Client,
     pub router: Arc<ArcSwap<CacheRouter>>,
-    pub retry_config: RetryConfig,
-    pub request_timeout: Duration,
+    pub proxy_config: ProxyConfig,
 }
 
 pub fn build_app(state: AppState) -> Router {
@@ -44,8 +42,7 @@ async fn chat_completions_handler(
         &reqwest::Method::POST,
         body,
         &headers,
-        &state.retry_config,
-        state.request_timeout,
+        &state.proxy_config,
     )
     .await
 }
@@ -63,8 +60,7 @@ async fn completions_handler(
         &reqwest::Method::POST,
         body,
         &headers,
-        &state.retry_config,
-        state.request_timeout,
+        &state.proxy_config,
     )
     .await
 }
@@ -82,8 +78,7 @@ async fn messages_handler(
         &reqwest::Method::POST,
         body,
         &headers,
-        &state.retry_config,
-        state.request_timeout,
+        &state.proxy_config,
     )
     .await
 }
@@ -112,8 +107,7 @@ async fn fallback_handler(
         &reqwest_method,
         body,
         &headers,
-        &state.retry_config,
-        state.request_timeout,
+        &state.proxy_config,
     )
     .await
 }

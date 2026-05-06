@@ -35,7 +35,7 @@ pub struct AppConfig {
     pub health: HealthSection,
 
     #[serde(default)]
-    pub retry: RetrySection,
+    pub proxy: ProxySection,
 
     #[serde(default)]
     pub circuit_breaker: CircuitBreakerSection,
@@ -49,7 +49,6 @@ pub struct AppConfig {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
-    pub request_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -74,12 +73,14 @@ pub struct HealthSection {
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct RetrySection {
+pub struct ProxySection {
     pub max_retries: u32,
     pub initial_backoff_ms: u64,
     pub max_backoff_ms: u64,
     pub backoff_multiplier: f32,
     pub jitter_factor: f32,
+    pub request_timeout_secs: u64,
+    pub add_routed_peer_header: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -119,7 +120,6 @@ impl Default for ServerConfig {
         Self {
             host: "0.0.0.0".to_string(),
             port: 6700,
-            request_timeout_secs: 10000,
         }
     }
 }
@@ -148,7 +148,7 @@ impl Default for HealthSection {
     }
 }
 
-impl Default for RetrySection {
+impl Default for ProxySection {
     fn default() -> Self {
         Self {
             max_retries: 3,
@@ -156,6 +156,8 @@ impl Default for RetrySection {
             max_backoff_ms: 5000,
             backoff_multiplier: 2.0,
             jitter_factor: 0.25,
+            request_timeout_secs: 10000,
+            add_routed_peer_header: false,
         }
     }
 }
@@ -190,12 +192,14 @@ pub struct CacheConfig {
 }
 
 #[derive(Debug, Clone)]
-pub struct RetryConfig {
+pub struct ProxyConfig {
     pub max_retries: u32,
     pub initial_backoff_ms: u64,
     pub max_backoff_ms: u64,
     pub backoff_multiplier: f32,
     pub jitter_factor: f32,
+    pub request_timeout_secs: u64,
+    pub add_routed_peer_header: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -243,10 +247,10 @@ impl AppConfig {
             )
             .into());
         }
-        if !(0.0..=1.0).contains(&self.retry.jitter_factor) {
+        if !(0.0..=1.0).contains(&self.proxy.jitter_factor) {
             return Err(format!(
-                "retry.jitter_factor must be 0.0-1.0, got {}",
-                self.retry.jitter_factor
+                "proxy.jitter_factor must be 0.0-1.0, got {}",
+                self.proxy.jitter_factor
             )
             .into());
         }
@@ -267,13 +271,15 @@ impl AppConfig {
         }
     }
 
-    pub fn retry_config(&self) -> RetryConfig {
-        RetryConfig {
-            max_retries: self.retry.max_retries,
-            initial_backoff_ms: self.retry.initial_backoff_ms,
-            max_backoff_ms: self.retry.max_backoff_ms,
-            backoff_multiplier: self.retry.backoff_multiplier,
-            jitter_factor: self.retry.jitter_factor,
+    pub fn proxy_config(&self) -> ProxyConfig {
+        ProxyConfig {
+            max_retries: self.proxy.max_retries,
+            initial_backoff_ms: self.proxy.initial_backoff_ms,
+            max_backoff_ms: self.proxy.max_backoff_ms,
+            backoff_multiplier: self.proxy.backoff_multiplier,
+            jitter_factor: self.proxy.jitter_factor,
+            request_timeout_secs: self.proxy.request_timeout_secs,
+            add_routed_peer_header: self.proxy.add_routed_peer_header,
         }
     }
 
@@ -286,9 +292,6 @@ impl AppConfig {
         }
     }
 
-    pub fn request_timeout(&self) -> Duration {
-        Duration::from_secs(self.server.request_timeout_secs)
-    }
 
     /// Validates that only the workers field has changed between configs.
     /// Returns Ok(()) if reload is safe, Err with details if not.
@@ -319,11 +322,11 @@ impl AppConfig {
             ));
         }
 
-        // Check retry config
-        if self.retry != new_config.retry {
+        // Check proxy config
+        if self.proxy != new_config.proxy {
             errors.push(format!(
-                "retry config changed (old: {:?}, new: {:?})",
-                self.retry, new_config.retry
+                "proxy config changed (old: {:?}, new: {:?})",
+                self.proxy, new_config.proxy
             ));
         }
 
@@ -378,7 +381,7 @@ workers:
         assert_eq!(config.server.port, 6700);
         assert_eq!(config.cache.threshold, 0.3);
         assert_eq!(config.health.interval_secs, 10);
-        assert_eq!(config.retry.max_retries, 3);
+        assert_eq!(config.proxy.max_retries, 3);
         assert_eq!(config.circuit_breaker.failure_threshold, 5);
         assert_eq!(config.logging.level, "info");
     }
@@ -389,7 +392,6 @@ workers:
 server:
   host: "127.0.0.1"
   port: 9090
-  request_timeout_secs: 600
 workers:
   - url: "http://node1:8050"
     max_load: 10
@@ -406,12 +408,13 @@ health:
   interval_secs: 20
   failure_threshold: 5
   success_threshold: 2
-retry:
+proxy:
   max_retries: 5
   initial_backoff_ms: 200
   max_backoff_ms: 10000
   backoff_multiplier: 3.0
   jitter_factor: 0.5
+  request_timeout_secs: 600
 circuit_breaker:
   failure_threshold: 10
   success_threshold: 3
@@ -426,14 +429,14 @@ logging:
         let config = AppConfig::load(file.path()).unwrap();
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.port, 9090);
-        assert_eq!(config.server.request_timeout_secs, 600);
         assert_eq!(config.workers.len(), 2);
         assert_eq!(config.workers[0].max_load, 10);
         assert_eq!(config.workers[1].max_load, 30);
         assert_eq!(config.cache.threshold, 0.5);
         assert_eq!(config.cache.balance_abs_threshold, 64);
         assert_eq!(config.health.endpoint, "/healthz");
-        assert_eq!(config.retry.max_retries, 5);
+        assert_eq!(config.proxy.max_retries, 5);
+        assert_eq!(config.proxy.request_timeout_secs, 600);
         assert_eq!(config.circuit_breaker.timeout_secs, 60);
         assert_eq!(config.logging.level, "debug");
     }
@@ -548,7 +551,7 @@ workers:
 cache:
   threshold: 0.4
   balance_abs_threshold: 50
-retry:
+proxy:
   max_retries: 4
   initial_backoff_ms: 150
 health:
@@ -565,16 +568,14 @@ health:
         assert_eq!(cache_config.cache_threshold, 0.4);
         assert_eq!(cache_config.balance_abs_threshold, 50);
 
-        let retry_config = config.retry_config();
-        assert_eq!(retry_config.max_retries, 4);
-        assert_eq!(retry_config.initial_backoff_ms, 150);
+        let proxy_config = config.proxy_config();
+        assert_eq!(proxy_config.max_retries, 4);
+        assert_eq!(proxy_config.initial_backoff_ms, 150);
+        assert_eq!(proxy_config.request_timeout_secs, 10000);
 
         let health_config = config.health_config();
         assert_eq!(health_config.endpoint, "/status");
         assert_eq!(health_config.interval, Duration::from_secs(15));
-
-        let timeout = config.request_timeout();
-        assert_eq!(timeout, Duration::from_secs(10000));
     }
 
     #[test]

@@ -31,7 +31,4 @@ pub fn record_request_duration(_worker_url: &str, _duration: Duration) {}
 pub fn record_load_balancing_event() {}
 
 #[inline(always)]
-pub fn set_load_range(_max: usize, _min: usize) {}
-
-#[inline(always)]
 pub fn record_health_check(_worker_url: &str, _healthy: bool) {}

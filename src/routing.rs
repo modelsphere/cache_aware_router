@@ -30,6 +30,7 @@ impl CacheRouter {
         if config.eviction_interval_secs > 0 {
             let tree_clone = Arc::clone(&tree);
             let lock_clone = Arc::clone(&eviction_lock);
+            let workers_clone = workers.clone();
             let max_size = config.max_tree_size;
             let interval = std::time::Duration::from_secs(config.eviction_interval_secs);
 
@@ -45,7 +46,8 @@ impl CacheRouter {
                         tree_clone.evict_tenant_by_size(max_size);
                     }
                     unsafe { libc::malloc_trim(0); }
-                    info!("Tree eviction pass complete (max_tree_size={}, took {:?})", max_size, start.elapsed());
+                    let total_load: usize = workers_clone.iter().map(|w| w.load()).sum();
+                    info!("Tree eviction pass complete (max_tree_size={}, took {:?}). Active load = {}.", max_size, start.elapsed(), total_load);
                 }
             });
         }
@@ -64,7 +66,7 @@ impl CacheRouter {
 
     /// Select a worker for the given request text.
     /// Returns worker index, or None if no workers available.
-    pub fn select_worker(&self, request_text: &str) -> Option<usize> {
+    pub fn select_worker(&self, request_text: &str, exclude: Option<usize>) -> Option<usize> {
         let start = std::time::Instant::now();
 
         // Filter to available workers (healthy + circuit breaker open)
@@ -72,7 +74,7 @@ impl CacheRouter {
             .workers
             .iter()
             .enumerate()
-            .filter(|(_, w)| w.is_available())
+            .filter(|(idx, w)| w.is_available() && exclude != Some(*idx))
             .map(|(idx, _)| idx)
             .collect();
 
@@ -86,49 +88,15 @@ impl CacheRouter {
             return Some(idx);
         }
 
-        // Check if load is imbalanced
         let loads: Vec<usize> = available.iter().map(|&idx| self.workers[idx].load()).collect();
-        let max_load = *loads.iter().max().unwrap();
         let min_load = *loads.iter().min().unwrap();
+        let min_idx = loads
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, &load)| load)
+            .map(|(idx, _)| available[idx])?;
 
-        let abs_diff = max_load.saturating_sub(min_load);
-        let rel_ratio = if min_load > 0 {
-            max_load as f32 / min_load as f32
-        } else {
-            f32::INFINITY
-        };
-
-        let is_imbalanced = abs_diff >= self.config.balance_abs_threshold
-            && rel_ratio >= self.config.balance_rel_threshold;
-
-        if is_imbalanced {
-            // Imbalanced mode: route to least-loaded worker
-            let min_idx = loads
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, &load)| load)
-                .map(|(idx, _)| available[idx])?;
-
-            info!(
-                "Route: load_imbalanced → {} load={} | {}/{} {:.2} {:.3}ms",
-                self.workers[min_idx].url(), self.workers[min_idx].load(),
-                min_load, max_load, rel_ratio,
-                start.elapsed().as_secs_f64() * 1000.0
-            );
-            metrics::record_load_balancing_event();
-            metrics::set_load_range(max_load, min_load);
-
-            return Some(min_idx);
-        }
-
-        // Balanced mode: use cache-aware routing
         if request_text.is_empty() {
-            // No text to match, fall back to least-loaded
-            let min_idx = loads
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, &load)| load)
-                .map(|(idx, _)| available[idx])?;
             info!(
                 "Route: empty_text → {} load={} | {:.3}ms",
                 self.workers[min_idx].url(), self.workers[min_idx].load(),
@@ -137,7 +105,7 @@ impl CacheRouter {
             return Some(min_idx);
         }
 
-        // Find best prefix match
+        // Always run prefix matching first
         let match_result = self.tree.prefix_match_with_counts(request_text);
         let match_ratio = if match_result.input_char_count > 0 {
             match_result.matched_char_count as f32 / match_result.input_char_count as f32
@@ -158,17 +126,40 @@ impl CacheRouter {
             && match_result.matched_char_count >= self.config.match_abs_threshold;
 
         if above_ratio || above_absolute {
-            // Good cache hit, route to matched worker
             let matched_worker_idx = self
                 .workers
                 .iter()
-                .position(|w| w.url() == match_result.tenant.as_ref())?;
+                .position(|w| w.url() == match_result.tenant.as_ref());
 
-            // Verify the matched worker is available
-            if available.contains(&matched_worker_idx) {
+            if let Some(matched_worker_idx) = matched_worker_idx.filter(|idx| available.contains(idx)) {
+                let matched_load = self.workers[matched_worker_idx].load();
+
+                // Check if the matched worker is itself imbalanced vs. the least-loaded
+                let matched_abs_diff = matched_load.saturating_sub(min_load);
+                let matched_rel_ratio = if min_load > 0 {
+                    matched_load as f32 / min_load as f32
+                } else {
+                    f32::INFINITY
+                };
+
+                let matched_is_overloaded =
+                    matched_abs_diff >= self.config.balance_abs_threshold
+                        && matched_rel_ratio >= self.config.balance_rel_threshold;
+
+                if matched_is_overloaded {
+                    info!(
+                        "Route: hit_overloaded → {} load={} | {}/{} {:.2} {:.3}ms",
+                        self.workers[min_idx].url(), self.workers[min_idx].load(),
+                        min_load, matched_load, matched_rel_ratio,
+                        start.elapsed().as_secs_f64() * 1000.0
+                    );
+                    metrics::record_load_balancing_event();
+                    return Some(min_idx);
+                }
+
                 info!(
                     "Route: cache_hit → {} load={} | matched={}/{} {:.2} {:.3}ms",
-                    match_result.tenant, self.workers[matched_worker_idx].load(),
+                    match_result.tenant, matched_load,
                     match_result.matched_char_count, match_result.input_char_count, match_ratio,
                     start.elapsed().as_secs_f64() * 1000.0
                 );
@@ -184,12 +175,6 @@ impl CacheRouter {
 
         // Cache miss or matched worker unavailable: route to least-loaded
         metrics::record_cache_miss();
-        let min_idx = loads
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, &load)| load)
-            .map(|(idx, _)| available[idx])?;
-
         info!(
             "Route: cache_miss → {} load={} | matched={}/{} {:.2} {:.3}ms",
             self.workers[min_idx].url(), self.workers[min_idx].load(),
