@@ -60,6 +60,7 @@ pub struct CacheSection {
     pub balance_rel_threshold: f32,
     pub eviction_interval_secs: u64,
     pub max_tree_size: usize,
+    pub daily_cleanup_hour_utc: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -133,6 +134,7 @@ impl Default for CacheSection {
             balance_rel_threshold: 1.6,
             eviction_interval_secs: 60,
             max_tree_size: 1048576,
+            daily_cleanup_hour_utc: -1,
         }
     }
 }
@@ -189,6 +191,7 @@ pub struct CacheConfig {
     pub balance_rel_threshold: f32,
     pub eviction_interval_secs: u64,
     pub max_tree_size: usize,
+    pub daily_cleanup_hour_utc: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -257,6 +260,13 @@ impl AppConfig {
         if self.server.port == 0 {
             return Err("server.port must be > 0".into());
         }
+        if self.cache.daily_cleanup_hour_utc > 23 {
+            return Err(format!(
+                "cache.daily_cleanup_hour_utc must be -1 (disabled) or 0-23, got {}",
+                self.cache.daily_cleanup_hour_utc
+            )
+            .into());
+        }
         Ok(())
     }
 
@@ -268,6 +278,7 @@ impl AppConfig {
             balance_rel_threshold: self.cache.balance_rel_threshold,
             eviction_interval_secs: self.cache.eviction_interval_secs,
             max_tree_size: self.cache.max_tree_size,
+            daily_cleanup_hour_utc: self.cache.daily_cleanup_hour_utc,
         }
     }
 

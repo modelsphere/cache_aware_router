@@ -3,8 +3,9 @@ use crate::metrics;
 use crate::tree::Tree;
 use crate::worker::Worker;
 use parking_lot::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, trace, warn};
 
 pub struct CacheRouter {
@@ -14,6 +15,7 @@ pub struct CacheRouter {
     /// Prevents deadlock between insert and eviction.
     /// Inserts take read lock (concurrent), eviction takes write lock (exclusive).
     eviction_lock: Arc<RwLock<()>>,
+    eviction_shutdown: Arc<AtomicBool>,
 }
 
 impl CacheRouter {
@@ -26,6 +28,8 @@ impl CacheRouter {
             tree.insert("", worker.url());
         }
 
+        let eviction_shutdown = Arc::new(AtomicBool::new(false));
+
         // Spawn background eviction thread if enabled
         if config.eviction_interval_secs > 0 {
             let tree_clone = Arc::clone(&tree);
@@ -33,21 +37,45 @@ impl CacheRouter {
             let workers_clone = workers.clone();
             let max_size = config.max_tree_size;
             let interval = std::time::Duration::from_secs(config.eviction_interval_secs);
+            let shutdown = Arc::clone(&eviction_shutdown);
+            let cleanup_hour = config.daily_cleanup_hour_utc;
 
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(interval);
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut last_cleanup_day: Option<u64> = None;
 
                 loop {
                     ticker.tick().await;
+                    let is_shutting_down = shutdown.load(Ordering::Relaxed);
+
+                    let do_full_cleanup = is_shutting_down || (cleanup_hour >= 0 && {
+                        let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                        let (today, hour) = (secs / 86400, (secs % 86400) / 3600);
+                        let due = hour >= cleanup_hour as u64 && last_cleanup_day != Some(today);
+                        if due { last_cleanup_day = Some(today); }
+                        due
+                    });
+
+                    if is_shutting_down {
+                        info!("Eviction task shutting down, clearing the tree (reload).");
+                    } else if do_full_cleanup {
+                        info!("Starting daily tree cleanup (evicting all entries).");
+                    }
+                    let effective_size = if do_full_cleanup { 0 } else { max_size };
                     let start = std::time::Instant::now();
                     {
                         let _guard = lock_clone.write();
-                        tree_clone.evict_tenant_by_size(max_size);
+                        tree_clone.evict_tenant_by_size(effective_size);
                     }
                     unsafe { libc::malloc_trim(0); }
                     let total_load: usize = workers_clone.iter().map(|w| w.load()).sum();
-                    info!("Tree eviction pass complete (max_tree_size={}, took {:?}). Active load = {}.", max_size, start.elapsed(), total_load);
+                    info!("Tree eviction pass complete (eviction size={}, took {:?}). Active load = {}.", effective_size, start.elapsed(), total_load);
+
+                    if is_shutting_down {
+                        info!("Eviction task shutdown completed.");
+                        break;
+                    }
                 }
             });
         }
@@ -57,6 +85,7 @@ impl CacheRouter {
             tree,
             config,
             eviction_lock,
+            eviction_shutdown,
         }
     }
 
@@ -199,5 +228,11 @@ impl CacheRouter {
             warn!("Skipping tree insert: eviction lock held >100ms");
         }
         metrics::record_request_routed(worker_url);
+    }
+}
+
+impl Drop for CacheRouter {
+    fn drop(&mut self) {
+        self.eviction_shutdown.store(true, Ordering::Relaxed);
     }
 }

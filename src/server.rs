@@ -7,6 +7,7 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
+use axum::extract::DefaultBodyLimit;
 use axum::Router;
 use serde_json::json;
 use std::sync::Arc;
@@ -26,6 +27,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/health", get(health_handler))
         .route("/workers", get(workers_handler))
         .fallback(fallback_handler)
+        .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
         .with_state(state)
 }
 

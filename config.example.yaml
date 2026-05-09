@@ -25,6 +25,8 @@ cache:
   eviction_interval_secs: 60
   # Maximum nodes per radix tree before eviction
   max_tree_size: 1048576
+  # Hour (0-23 UTC) to run daily full tree cleanup (-1 to disable)
+  daily_cleanup_hour_utc: -1
 
 health:
   endpoint: "/health"

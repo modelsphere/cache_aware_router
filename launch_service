@@ -1,0 +1,14 @@
+#!/bin/bash
+
+CURRENT_LIMIT=$(ulimit -n)
+if [ "$CURRENT_LIMIT" -lt 65535 ]; then
+    echo "Error: ulimit -n $CURRENT_LIMIT is too low (minimum 65535 required)"
+    exit 1
+fi
+
+date
+cat /proc/cpuinfo | tail -n 50
+export
+date
+
+exec ./cache-aware-router -c configs/config.yaml
