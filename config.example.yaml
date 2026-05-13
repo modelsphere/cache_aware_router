@@ -5,7 +5,7 @@ server:
   host: "0.0.0.0"
   port: 6700
 
-# Backend vLLM worker URLs (required, at least one)
+# Backend vLLM worker URLs (required, list)
 workers:
   - url: "http://node1:8050"
     max_load: 20
@@ -20,7 +20,7 @@ cache:
   # Absolute load difference threshold for imbalance detection
   balance_abs_threshold: 5
   # Relative load ratio threshold for imbalance detection
-  balance_rel_threshold: 1.6
+  balance_rel_threshold: 1.25
   # LRU eviction interval in seconds (0 to disable)
   eviction_interval_secs: 60
   # Maximum nodes per radix tree before eviction
@@ -35,13 +35,14 @@ health:
   success_threshold: 1
 
 proxy:
-  max_retries: 3
+  max_retries: 1
   initial_backoff_ms: 100
   max_backoff_ms: 5000
   backoff_multiplier: 2.0
   jitter_factor: 0.25
   request_timeout_secs: 10000
   add_routed_peer_header: false
+  max_body_size: 10485760
 
 circuit_breaker:
   failure_threshold: 5

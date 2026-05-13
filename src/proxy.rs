@@ -244,7 +244,7 @@ pub async fn proxy_request(
     let request_text = extract_request_text(&body, path);
     let start = Instant::now();
 
-    let max_attempts = proxy_config.max_retries.max(1);
+    let max_attempts = proxy_config.max_retries + 1;
     let mut last_response: Option<Response> = None;
     let mut last_failed: Option<usize> = None;
 

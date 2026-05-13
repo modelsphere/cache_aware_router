@@ -82,6 +82,7 @@ pub struct ProxySection {
     pub jitter_factor: f32,
     pub request_timeout_secs: u64,
     pub add_routed_peer_header: bool,
+    pub max_body_size: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -131,7 +132,7 @@ impl Default for CacheSection {
             threshold: 0.3,
             match_abs_threshold: 8192,
             balance_abs_threshold: 5,
-            balance_rel_threshold: 1.6,
+            balance_rel_threshold: 1.25,
             eviction_interval_secs: 60,
             max_tree_size: 1048576,
             daily_cleanup_hour_utc: -1,
@@ -153,13 +154,14 @@ impl Default for HealthSection {
 impl Default for ProxySection {
     fn default() -> Self {
         Self {
-            max_retries: 3,
+            max_retries: 1,
             initial_backoff_ms: 100,
             max_backoff_ms: 5000,
             backoff_multiplier: 2.0,
             jitter_factor: 0.25,
             request_timeout_secs: 10000,
             add_routed_peer_header: false,
+            max_body_size: 10 * 1024 * 1024,
         }
     }
 }
@@ -203,6 +205,7 @@ pub struct ProxyConfig {
     pub jitter_factor: f32,
     pub request_timeout_secs: u64,
     pub add_routed_peer_header: bool,
+    pub max_body_size: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -291,6 +294,7 @@ impl AppConfig {
             jitter_factor: self.proxy.jitter_factor,
             request_timeout_secs: self.proxy.request_timeout_secs,
             add_routed_peer_header: self.proxy.add_routed_peer_header,
+            max_body_size: self.proxy.max_body_size,
         }
     }
 
@@ -392,7 +396,7 @@ workers:
         assert_eq!(config.server.port, 6700);
         assert_eq!(config.cache.threshold, 0.3);
         assert_eq!(config.health.interval_secs, 10);
-        assert_eq!(config.proxy.max_retries, 3);
+        assert_eq!(config.proxy.max_retries, 1);
         assert_eq!(config.circuit_breaker.failure_threshold, 5);
         assert_eq!(config.logging.level, "info");
     }

@@ -51,8 +51,8 @@ impl CacheRouter {
 
                     let do_full_cleanup = is_shutting_down || (cleanup_hour >= 0 && {
                         let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-                        let (today, hour) = (secs / 86400, (secs % 86400) / 3600);
-                        let due = hour >= cleanup_hour as u64 && last_cleanup_day != Some(today);
+                        let (today, minute_of_day) = (secs / 86400, (secs % 86400) / 60);
+                        let due = minute_of_day >= cleanup_hour as u64 * 60 + 8 && last_cleanup_day != Some(today);
                         if due { last_cleanup_day = Some(today); }
                         due
                     });

@@ -20,6 +20,7 @@ pub struct AppState {
 }
 
 pub fn build_app(state: AppState) -> Router {
+    let max_body_size = state.proxy_config.max_body_size;
     Router::new()
         .route("/v1/chat/completions", post(chat_completions_handler))
         .route("/v1/completions", post(completions_handler))
@@ -27,7 +28,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/health", get(health_handler))
         .route("/workers", get(workers_handler))
         .fallback(fallback_handler)
-        .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(max_body_size))
         .with_state(state)
 }
 
