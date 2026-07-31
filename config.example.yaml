@@ -43,6 +43,8 @@ proxy:
   request_timeout_secs: 10000
   add_routed_peer_header: false
   max_body_size: 10485760
+  # HTTP status code for remote media URLs (200=allow, 4xx/5xx=reject with that code)
+  remote_media_url_policy: 200
 
 circuit_breaker:
   failure_threshold: 5

@@ -83,6 +83,7 @@ pub struct ProxySection {
     pub request_timeout_secs: u64,
     pub add_routed_peer_header: bool,
     pub max_body_size: usize,
+    pub remote_media_url_policy: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -105,10 +106,16 @@ pub struct WorkerEntry {
     pub url: String,
     #[serde(default = "default_max_load")]
     pub max_load: usize,
+    #[serde(default = "default_load_penalty")]
+    pub load_penalty: usize,
 }
 
 fn default_max_load() -> usize {
     20
+}
+
+fn default_load_penalty() -> usize {
+    0
 }
 
 impl AppConfig {
@@ -143,7 +150,7 @@ impl Default for CacheSection {
 impl Default for HealthSection {
     fn default() -> Self {
         Self {
-            endpoint: "/health".to_string(),
+            endpoint: "/v1/models".to_string(),
             interval_secs: 10,
             failure_threshold: 3,
             success_threshold: 1,
@@ -162,6 +169,7 @@ impl Default for ProxySection {
             request_timeout_secs: 10000,
             add_routed_peer_header: false,
             max_body_size: 10 * 1024 * 1024,
+            remote_media_url_policy: 200,
         }
     }
 }
@@ -206,6 +214,7 @@ pub struct ProxyConfig {
     pub request_timeout_secs: u64,
     pub add_routed_peer_header: bool,
     pub max_body_size: usize,
+    pub remote_media_url_policy: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -239,11 +248,7 @@ impl AppConfig {
                 .into());
             }
             if entry.max_load == 0 {
-                return Err(format!(
-                    "max_load must be > 0 for worker '{}'",
-                    entry.url
-                )
-                .into());
+                return Err(format!("max_load must be > 0 for worker '{}'", entry.url).into());
             }
         }
         if !(0.0..=1.0).contains(&self.cache.threshold) {
@@ -262,6 +267,14 @@ impl AppConfig {
         }
         if self.server.port == 0 {
             return Err("server.port must be > 0".into());
+        }
+        let policy = self.proxy.remote_media_url_policy;
+        if policy != 200 && !matches!(policy, 400..=599) {
+            return Err(format!(
+                "proxy.remote_media_url_policy must be 200 or a valid 4xx/5xx HTTP status code, got {}",
+                policy
+            )
+            .into());
         }
         if self.cache.daily_cleanup_hour_utc > 23 {
             return Err(format!(
@@ -295,6 +308,7 @@ impl AppConfig {
             request_timeout_secs: self.proxy.request_timeout_secs,
             add_routed_peer_header: self.proxy.add_routed_peer_header,
             max_body_size: self.proxy.max_body_size,
+            remote_media_url_policy: self.proxy.remote_media_url_policy,
         }
     }
 
@@ -306,7 +320,6 @@ impl AppConfig {
             success_threshold: self.health.success_threshold,
         }
     }
-
 
     /// Validates that only the workers field has changed between configs.
     /// Returns Ok(()) if reload is safe, Err with details if not.
@@ -519,7 +532,10 @@ workers:
 
         let result = AppConfig::load(file.path());
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("max_load must be > 0"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("max_load must be > 0"));
     }
 
     #[test]
@@ -668,5 +684,87 @@ server:
         let c2 = AppConfig::load(f2.path()).unwrap();
         let err = c1.validate_reload_compatibility(&c2).unwrap_err();
         assert!(err.contains("server config changed"));
+    }
+
+    #[test]
+    fn test_remote_media_url_policy_default_200() {
+        let yaml = r#"
+workers:
+  - url: "http://localhost:8050"
+"#;
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+        file.flush().unwrap();
+
+        let config = AppConfig::load(file.path()).unwrap();
+        assert_eq!(config.proxy.remote_media_url_policy, 200);
+    }
+
+    #[test]
+    fn test_remote_media_url_policy_400_accepted() {
+        let yaml = r#"
+workers:
+  - url: "http://localhost:8050"
+proxy:
+  remote_media_url_policy: 400
+"#;
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+        file.flush().unwrap();
+
+        let config = AppConfig::load(file.path()).unwrap();
+        assert_eq!(config.proxy.remote_media_url_policy, 400);
+    }
+
+    #[test]
+    fn test_remote_media_url_policy_500_accepted() {
+        let yaml = r#"
+workers:
+  - url: "http://localhost:8050"
+proxy:
+  remote_media_url_policy: 500
+"#;
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+        file.flush().unwrap();
+
+        let config = AppConfig::load(file.path()).unwrap();
+        assert_eq!(config.proxy.remote_media_url_policy, 500);
+    }
+
+    #[test]
+    fn test_remote_media_url_policy_999_rejected() {
+        let yaml = r#"
+workers:
+  - url: "http://localhost:8050"
+proxy:
+  remote_media_url_policy: 999
+"#;
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+        file.flush().unwrap();
+
+        let result = AppConfig::load(file.path());
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("remote_media_url_policy must be 200 or a valid 4xx/5xx"));
+    }
+
+    #[test]
+    fn test_remote_media_url_policy_300_rejected() {
+        let yaml = r#"
+workers:
+  - url: "http://localhost:8050"
+proxy:
+  remote_media_url_policy: 300
+"#;
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+        file.flush().unwrap();
+
+        let result = AppConfig::load(file.path());
+        assert!(result.is_err());
     }
 }

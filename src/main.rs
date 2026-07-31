@@ -63,6 +63,7 @@ async fn main() {
             Arc::new(Worker::new(
                 entry.url.clone(),
                 entry.max_load,
+                entry.load_penalty,
                 health_config.clone(),
                 cb_config.clone(),
             ))
@@ -183,6 +184,7 @@ fn spawn_reload_handler(
                     Arc::new(Worker::new(
                         entry.url.clone(),
                         entry.max_load,
+                        entry.load_penalty,
                         health_config.clone(),
                         cb_config.clone(),
                     ))
@@ -209,7 +211,10 @@ fn spawn_reload_handler(
             *current_config.lock() = new_config;
 
             info!("Config reloaded successfully");
-            info!("Current config:\n{}", current_config.lock().effective_dump());
+            info!(
+                "Current config:\n{}",
+                current_config.lock().effective_dump()
+            );
         }
     });
 }

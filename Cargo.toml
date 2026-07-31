@@ -1,6 +1,6 @@
 [package]
 name = "cache-aware-router"
-version = "0.3.1"
+version = "0.6.1"
 edition = "2021"
 
 [[bin]]
@@ -30,7 +30,7 @@ libc = "0.2"
 [profile.release]
 opt-level = 3
 lto = true
-debug-assertion = true
+debug-assertions = true
 overflow-checks = true
 panic = 'abort'
 

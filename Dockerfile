@@ -8,6 +8,7 @@ WORKDIR /workspace
 
 COPY ./target/release/cache-aware-router /workspace/cache-aware-router
 COPY ./config.example.yaml /workspace/config.example.yaml
+COPY ./cartctl /workspace/cartctl
 COPY ./launch_service /workspace/launch_service
 
 ENTRYPOINT ["./launch_service"]

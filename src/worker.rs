@@ -44,6 +44,7 @@ pub struct Worker {
     url: String,
     load_counter: AtomicUsize,
     max_load: usize,
+    load_penalty: usize,
     healthy: AtomicBool,
     consecutive_failures: AtomicUsize,
     consecutive_successes: AtomicUsize,
@@ -63,11 +64,18 @@ impl fmt::Debug for Worker {
 }
 
 impl Worker {
-    pub fn new(url: String, max_load: usize, health_config: HealthConfig, cb_config: CircuitBreakerConfig) -> Self {
+    pub fn new(
+        url: String,
+        max_load: usize,
+        load_penalty: usize,
+        health_config: HealthConfig,
+        cb_config: CircuitBreakerConfig,
+    ) -> Self {
         Self {
             url,
             load_counter: AtomicUsize::new(0),
             max_load,
+            load_penalty,
             healthy: AtomicBool::new(true),
             consecutive_failures: AtomicUsize::new(0),
             consecutive_successes: AtomicUsize::new(0),
@@ -96,6 +104,23 @@ impl Worker {
 
     pub fn load(&self) -> usize {
         self.load_counter.load(Ordering::Relaxed)
+    }
+
+    pub fn effective_load(&self) -> usize {
+        self.load().saturating_add(self.load_penalty)
+    }
+
+    pub fn load_penalty(&self) -> usize {
+        self.load_penalty
+    }
+
+    pub fn load_display(&self) -> String {
+        let load = self.load();
+        if self.load_penalty > 0 {
+            format!("{}(+{})", load, self.load_penalty)
+        } else {
+            format!("{}", load)
+        }
     }
 
     pub fn increment_load(&self) {
@@ -133,7 +158,8 @@ impl Worker {
                 let successes = self.consecutive_successes.fetch_add(1, Ordering::Relaxed) + 1;
                 self.consecutive_failures.store(0, Ordering::Relaxed);
 
-                if !self.is_healthy() && successes >= self.health_config.success_threshold as usize {
+                if !self.is_healthy() && successes >= self.health_config.success_threshold as usize
+                {
                     info!("Worker {} recovered (healthy)", self.url);
                     self.healthy.store(true, Ordering::Release);
                     metrics::record_health_check(&self.url, true);
@@ -141,7 +167,11 @@ impl Worker {
                 true
             }
             Ok(response) => {
-                debug!("Worker {} health check failed: status {}", self.url, response.status());
+                debug!(
+                    "Worker {} health check failed: status {}",
+                    self.url,
+                    response.status()
+                );
                 self.handle_health_failure();
                 false
             }
@@ -158,12 +188,14 @@ impl Worker {
         self.consecutive_successes.store(0, Ordering::Relaxed);
 
         if self.is_healthy() && failures >= self.health_config.failure_threshold as usize {
-            warn!("Worker {} marked unhealthy after {} consecutive failures", self.url, failures);
+            warn!(
+                "Worker {} marked unhealthy after {} consecutive failures",
+                self.url, failures
+            );
             self.healthy.store(false, Ordering::Release);
             metrics::record_health_check(&self.url, false);
         }
     }
-
 }
 
 /// Background health checker for all workers
@@ -207,8 +239,9 @@ mod tests {
         Arc::new(Worker::new(
             "http://test".to_string(),
             10,
+            0,
             HealthConfig {
-                endpoint: "/health".to_string(),
+                endpoint: "/v1/models".to_string(),
                 interval: Duration::from_secs(10),
                 failure_threshold: 3,
                 success_threshold: 2,
@@ -263,4 +296,3 @@ mod tests {
         assert_eq!(worker.load(), 0);
     }
 }
-

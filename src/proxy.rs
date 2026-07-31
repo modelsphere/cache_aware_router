@@ -69,17 +69,17 @@ fn backoff_delay(config: &ProxyConfig, attempt: u32) -> Duration {
     }
 }
 
-/// Extract request text from the JSON body for cache-aware routing.
-/// Returns empty string on parse failure (graceful degradation).
-pub fn extract_request_text(body: &[u8], path: &str) -> String {
-    let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
+/// Extract request text from a pre-parsed JSON value for cache-aware routing.
+/// Returns empty string if json is None (parse failure) — graceful degradation.
+pub fn extract_request_text(json: Option<&serde_json::Value>, path: &str) -> String {
+    let Some(json) = json else {
         return String::new();
     };
 
     match path {
-        "/v1/chat/completions" => extract_chat_text(&json).unwrap_or_default(),
-        "/v1/completions" => extract_completion_text(&json).unwrap_or_default(),
-        "/v1/messages" => extract_messages_text(&json).unwrap_or_default(),
+        "/v1/chat/completions" => extract_chat_text(json).unwrap_or_default(),
+        "/v1/completions" => extract_completion_text(json).unwrap_or_default(),
+        "/v1/messages" => extract_messages_text(json).unwrap_or_default(),
         _ => String::new(),
     }
 }
@@ -95,7 +95,11 @@ fn extract_chat_text(json: &serde_json::Value) -> Option<String> {
         text.push_str(&messages.to_string());
     }
 
-    if text.is_empty() { None } else { Some(text) }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 fn extract_completion_text(json: &serde_json::Value) -> Option<String> {
@@ -117,7 +121,71 @@ fn extract_messages_text(json: &serde_json::Value) -> Option<String> {
         text.push_str(&messages.to_string());
     }
 
-    if text.is_empty() { None } else { Some(text) }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+// ------------------------------------------------------------------
+// Remote-media (image_url / video_url) SSRF guard
+// ------------------------------------------------------------------
+
+const REMOTE_MEDIA_ERROR_BODY: &str = r#"{"error":{"message":"Remote image/video URLs are not permitted.","type":"invalid_request_error","code":"remote_media_url_disallowed"}}"#;
+
+/// Extract the URL string from an `image_url` / `video_url` part.
+/// Handles both shorthand (`"image_url": "data:image/..."`) and object form
+/// (`"image_url": {"url": "data:image/..."}`).
+fn get_media_url<'v>(item: &'v serde_json::Value, key: &str) -> Option<&'v str> {
+    let media = item.get(key)?;
+    media.as_str().or_else(|| media.get("url")?.as_str())
+}
+
+/// Validate that no `image_url` or `video_url` in the request contains a remote URL.
+/// Operates on an already-parsed `serde_json::Value` (from `proxy_request`).
+///
+/// Returns `Ok(())` if the request is allowed, or `Err((status, body))` if it must be blocked.
+pub fn validate_remote_media(
+    json: Option<&serde_json::Value>,
+    path: &str,
+    policy: u16,
+) -> Result<(), (StatusCode, String)> {
+    // Allow if policy == 200, or path is not chat-like, or JSON didn't parse.
+    if policy == 200 || !matches!(path, "/v1/chat/completions" | "/v1/messages") {
+        return Ok(());
+    }
+    let json = match json {
+        Some(v) => v,
+        None => return Ok(()),
+    };
+
+    let Some(msgs) = json.get("messages").and_then(serde_json::Value::as_array) else {
+        return Ok(());
+    };
+
+    for msg in msgs {
+        let Some(parts) = msg.get("content").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for part in parts {
+            let key = match part.get("type").and_then(serde_json::Value::as_str) {
+                Some("image_url") => "image_url",
+                Some("video_url") => "video_url",
+                _ => continue,
+            };
+            let is_remote = get_media_url(part, key)
+                .and_then(|url| url.as_bytes().get(..5))
+                .is_some_and(|p| !p.eq_ignore_ascii_case(b"data:"));
+            if is_remote {
+                warn!("{} blocked remote media URL in request", path);
+                let status = StatusCode::from_u16(policy).unwrap_or(StatusCode::BAD_REQUEST);
+                return Err((status, REMOTE_MEDIA_ERROR_BODY.to_string()));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Check if the response indicates streaming (SSE)
@@ -186,9 +254,7 @@ async fn forward_to_worker(
     if is_streaming_response(&resp_headers) {
         // Streaming response: pipe the byte stream through
         let stream = response.bytes_stream().map(|result| {
-            result.map_err(|e| {
-                axum::Error::new(std::io::Error::new(std::io::ErrorKind::Other, e))
-            })
+            result.map_err(|e| axum::Error::new(std::io::Error::new(std::io::ErrorKind::Other, e)))
         });
 
         let mut builder = Response::builder().status(status.as_u16());
@@ -241,7 +307,22 @@ pub async fn proxy_request(
     headers: &HeaderMap,
     proxy_config: &ProxyConfig,
 ) -> Response {
-    let request_text = extract_request_text(&body, path);
+    let json_value = serde_json::from_slice::<serde_json::Value>(&body).ok();
+
+    // SSRF guard: block requests with remote (non-data-URI) image/video URLs
+    if let Err((status, body)) = validate_remote_media(
+        json_value.as_ref(),
+        path,
+        proxy_config.remote_media_url_policy,
+    ) {
+        return Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap_or_else(|_| status.into_response());
+    }
+
+    let request_text = extract_request_text(json_value.as_ref(), path);
     let start = Instant::now();
 
     let max_attempts = proxy_config.max_retries + 1;
@@ -287,8 +368,12 @@ pub async fn proxy_request(
                     last_failed = Some(worker_idx);
                     metrics::record_retry(attempt);
                     warn!(
-                        "{} → {} retryable error status={} attempt={}/{}, retrying",
-                        path, worker.url(), status.as_u16(), attempt + 1, max_attempts
+                        "{} → {} retryable error status={} retry={}/{}, retrying",
+                        path,
+                        worker.url(),
+                        status.as_u16(),
+                        attempt + 1,
+                        proxy_config.max_retries
                     );
 
                     let delay = backoff_delay(proxy_config, attempt);
@@ -299,10 +384,7 @@ pub async fn proxy_request(
                 }
 
                 if !status.is_success() {
-                    warn!(
-                        "{} → {} status={}",
-                        path, worker.url(), status.as_u16()
-                    );
+                    warn!("{} → {} status={}", path, worker.url(), status.as_u16());
                 }
 
                 router.record_routed(worker_idx, &request_text);
@@ -325,7 +407,10 @@ pub async fn proxy_request(
                 if proxy_config.add_routed_peer_header {
                     response.headers_mut().insert(
                         "x-routed-peer",
-                        worker.url().parse().unwrap_or_else(|_| "invalid".parse().unwrap()),
+                        worker
+                            .url()
+                            .parse()
+                            .unwrap_or_else(|_| "invalid".parse().unwrap()),
                     );
                 }
 
@@ -340,8 +425,12 @@ pub async fn proxy_request(
                     last_failed = Some(worker_idx);
                     metrics::record_retry(attempt);
                     warn!(
-                        "{} → {} connection error status={} attempt={}/{}, retrying",
-                        path, worker.url(), status.as_u16(), attempt + 1, max_attempts
+                        "{} → {} connection error status={} retry={}/{}, retrying",
+                        path,
+                        worker.url(),
+                        status.as_u16(),
+                        attempt + 1,
+                        proxy_config.max_retries
                     );
 
                     let delay = backoff_delay(proxy_config, attempt);
@@ -352,7 +441,10 @@ pub async fn proxy_request(
 
                 warn!(
                     "{} → {} connection error status={} all {} attempts exhausted",
-                    path, worker.url(), status.as_u16(), max_attempts
+                    path,
+                    worker.url(),
+                    status.as_u16(),
+                    max_attempts
                 );
                 return (status, "Backend unavailable").into_response();
             }
@@ -362,7 +454,11 @@ pub async fn proxy_request(
     // Exhausted all retries
     warn!("All {} retry attempts exhausted for {}", max_attempts, path);
     last_response.unwrap_or_else(|| {
-        (StatusCode::SERVICE_UNAVAILABLE, "All retry attempts exhausted").into_response()
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "All retry attempts exhausted",
+        )
+            .into_response()
     })
 }
 
@@ -374,4 +470,249 @@ fn is_streaming_sse(response: &Response) -> bool {
         .and_then(|v| v.to_str().ok())
         .map(|ct| ct.contains("text/event-stream"))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_json(s: &str) -> Option<serde_json::Value> {
+        serde_json::from_str(s).ok()
+    }
+
+    fn response_status(result: (StatusCode, String)) -> StatusCode {
+        result.0
+    }
+
+    #[tokio::test]
+    async fn test_allow_plain_text_content() {
+        let json = parse_json(r#"{"messages":[{"role":"user","content":"Hello"}]}"#);
+        assert!(validate_remote_media(json.as_ref(), "/v1/chat/completions", 400).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_allow_data_uri_image_url() {
+        let json = parse_json(
+            r#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":"data:image/png;base64,abc"}]}]}"#,
+        );
+        assert!(validate_remote_media(json.as_ref(), "/v1/chat/completions", 400).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_allow_data_uri_image_url_object_form() {
+        let json = parse_json(
+            r#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,abc"}}]}]}"#,
+        );
+        assert!(validate_remote_media(json.as_ref(), "/v1/chat/completions", 400).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_block_http_image_url_string_form() {
+        let json = parse_json(
+            r#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":"http://evil.com/img.png"}]}]}"#,
+        );
+        let result = validate_remote_media(json.as_ref(), "/v1/chat/completions", 400);
+        assert!(result.is_err());
+        assert_eq!(
+            response_status(result.unwrap_err()),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn test_block_https_image_url_string_form() {
+        let json = parse_json(
+            r#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":"https://evil.com/img.png"}]}]}"#,
+        );
+        let result = validate_remote_media(json.as_ref(), "/v1/chat/completions", 400);
+        assert!(result.is_err());
+        assert_eq!(
+            response_status(result.unwrap_err()),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn test_block_http_image_url_object_form() {
+        let json = parse_json(
+            r#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"http://evil.com/img.png"}}]}]}"#,
+        );
+        let result = validate_remote_media(json.as_ref(), "/v1/chat/completions", 400);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_block_video_url_string_form() {
+        let json = parse_json(
+            r#"{"messages":[{"role":"user","content":[{"type":"video_url","video_url":"http://evil.com/vid.mp4"}]}]}"#,
+        );
+        let result = validate_remote_media(json.as_ref(), "/v1/chat/completions", 400);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_block_video_url_object_form() {
+        let json = parse_json(
+            r#"{"messages":[{"role":"user","content":[{"type":"video_url","video_url":{"url":"https://evil.com/vid.mp4"}}]}]}"#,
+        );
+        let result = validate_remote_media(json.as_ref(), "/v1/chat/completions", 400);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_allow_when_policy_is_200() {
+        let json = parse_json(
+            r#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":"http://evil.com/img.png"}]}]}"#,
+        );
+        assert!(validate_remote_media(json.as_ref(), "/v1/chat/completions", 200).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_allow_non_chat_path() {
+        let json = parse_json(
+            r#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":"http://evil.com/img.png"}]}]}"#,
+        );
+        assert!(validate_remote_media(json.as_ref(), "/v1/completions", 400).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_allow_malformed_json() {
+        let json: Option<serde_json::Value> = None;
+        assert!(validate_remote_media(json.as_ref(), "/v1/chat/completions", 400).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_allow_missing_messages() {
+        let json = parse_json(r#"{"model":"gpt-4"}"#);
+        assert!(validate_remote_media(json.as_ref(), "/v1/chat/completions", 400).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_allow_messages_not_array() {
+        let json = parse_json(r#"{"messages":"not-an-array"}"#);
+        assert!(validate_remote_media(json.as_ref(), "/v1/chat/completions", 400).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_allow_content_string() {
+        let json = parse_json(r#"{"messages":[{"role":"user","content":"hello"}]}"#);
+        assert!(validate_remote_media(json.as_ref(), "/v1/chat/completions", 400).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_allow_unknown_part_type() {
+        let json = parse_json(
+            r#"{"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}"#,
+        );
+        assert!(validate_remote_media(json.as_ref(), "/v1/chat/completions", 400).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_allow_no_url_key_in_object() {
+        let json = parse_json(
+            r#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{}}]}]}"#,
+        );
+        assert!(validate_remote_media(json.as_ref(), "/v1/chat/completions", 400).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_allow_url_not_string() {
+        let json = parse_json(
+            r#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":123}}]}]}"#,
+        );
+        assert!(validate_remote_media(json.as_ref(), "/v1/chat/completions", 400).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_allow_data_uri_video_url() {
+        let json = parse_json(
+            r#"{"messages":[{"role":"user","content":[{"type":"video_url","video_url":"data:video/mp4;base64,abc"}]}]}"#,
+        );
+        assert!(validate_remote_media(json.as_ref(), "/v1/chat/completions", 400).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_block_returns_custom_status_500() {
+        let json = parse_json(
+            r#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":"http://evil.com/img.png"}]}]}"#,
+        );
+        let result = validate_remote_media(json.as_ref(), "/v1/chat/completions", 500);
+        assert!(result.is_err());
+        assert_eq!(
+            response_status(result.unwrap_err()),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn test_block_ftp_url() {
+        let json = parse_json(
+            r#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":"ftp://evil.com/img.png"}]}]}"#,
+        );
+        let result = validate_remote_media(json.as_ref(), "/v1/chat/completions", 400);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_allow_empty_content_array() {
+        let json = parse_json(r#"{"messages":[{"role":"user","content":[]}]}"#);
+        assert!(validate_remote_media(json.as_ref(), "/v1/chat/completions", 400).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_allow_empty_messages_array() {
+        let json = parse_json(r#"{"messages":[]}"#);
+        assert!(validate_remote_media(json.as_ref(), "/v1/chat/completions", 400).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_allow_missing_content_field() {
+        let json = parse_json(r#"{"messages":[{"role":"user"}]}"#);
+        assert!(validate_remote_media(json.as_ref(), "/v1/chat/completions", 400).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_allow_image_url_without_type() {
+        let json = parse_json(
+            r#"{"messages":[{"role":"user","content":[{"image_url":"http://evil.com/img.png"}]}]}"#,
+        );
+        assert!(validate_remote_media(json.as_ref(), "/v1/chat/completions", 400).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_extract_request_text_with_valid_json() {
+        let json = parse_json(r#"{"messages":[{"role":"user","content":"Hello"}]}"#);
+        let text = extract_request_text(json.as_ref(), "/v1/chat/completions");
+        assert!(text.contains("Hello"));
+    }
+
+    #[tokio::test]
+    async fn test_extract_request_text_with_none() {
+        let text = extract_request_text(None, "/v1/chat/completions");
+        assert!(text.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_extract_request_text_completions_path() {
+        let json = parse_json(r#"{"prompt":"summarize"}"#);
+        let text = extract_request_text(json.as_ref(), "/v1/completions");
+        assert_eq!(text, "summarize");
+    }
+
+    #[tokio::test]
+    async fn test_error_body_contains_expected_fields() {
+        let parsed: serde_json::Value = serde_json::from_str(REMOTE_MEDIA_ERROR_BODY).unwrap();
+        assert_eq!(
+            parsed["error"]["code"].as_str().unwrap(),
+            "remote_media_url_disallowed"
+        );
+        assert_eq!(
+            parsed["error"]["type"].as_str().unwrap(),
+            "invalid_request_error"
+        );
+        assert!(parsed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not permitted"));
+    }
 }

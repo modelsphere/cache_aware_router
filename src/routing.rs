@@ -3,6 +3,7 @@ use crate::metrics;
 use crate::tree::Tree;
 use crate::worker::Worker;
 use parking_lot::RwLock;
+use rand::seq::IndexedRandom;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -49,13 +50,20 @@ impl CacheRouter {
                     ticker.tick().await;
                     let is_shutting_down = shutdown.load(Ordering::Relaxed);
 
-                    let do_full_cleanup = is_shutting_down || (cleanup_hour >= 0 && {
-                        let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-                        let (today, minute_of_day) = (secs / 86400, (secs % 86400) / 60);
-                        let due = minute_of_day >= cleanup_hour as u64 * 60 + 8 && last_cleanup_day != Some(today);
-                        if due { last_cleanup_day = Some(today); }
-                        due
-                    });
+                    let do_full_cleanup = is_shutting_down
+                        || (cleanup_hour >= 0 && {
+                            let secs = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs();
+                            let (today, minute_of_day) = (secs / 86400, (secs % 86400) / 60);
+                            let due = minute_of_day >= cleanup_hour as u64 * 60 + 8
+                                && last_cleanup_day != Some(today);
+                            if due {
+                                last_cleanup_day = Some(today);
+                            }
+                            due
+                        });
 
                     if is_shutting_down {
                         info!("Eviction task shutting down, clearing the tree (reload).");
@@ -68,7 +76,9 @@ impl CacheRouter {
                         let _guard = lock_clone.write();
                         tree_clone.evict_tenant_by_size(effective_size);
                     }
-                    unsafe { libc::malloc_trim(0); }
+                    unsafe {
+                        libc::malloc_trim(0);
+                    }
                     let total_load: usize = workers_clone.iter().map(|w| w.load()).sum();
                     info!("Tree eviction pass complete (eviction size={}, took {:?}). Active load = {}.", effective_size, start.elapsed(), total_load);
 
@@ -113,22 +123,41 @@ impl CacheRouter {
 
         if available.len() == 1 {
             let idx = available[0];
-            trace!("Single available worker, routing to {}", self.workers[idx].url());
+            trace!(
+                "Single available worker, routing to {}",
+                self.workers[idx].url()
+            );
             return Some(idx);
         }
 
-        let loads: Vec<usize> = available.iter().map(|&idx| self.workers[idx].load()).collect();
+        let loads: Vec<usize> = available
+            .iter()
+            .map(|&idx| self.workers[idx].effective_load())
+            .collect();
         let min_load = *loads.iter().min().unwrap();
-        let min_idx = loads
+        let tied: Vec<usize> = loads
             .iter()
             .enumerate()
-            .min_by_key(|(_, &load)| load)
-            .map(|(idx, _)| available[idx])?;
+            .filter(|(_, &load)| load == min_load)
+            .map(|(idx, _)| available[idx])
+            .collect();
+        let min_idx = match tied.choose(&mut rand::rng()) {
+            Some(&idx) => idx,
+            None => {
+                warn!(
+                    "tie-break produced empty candidate set (available={}, loads={:?}) — returning 503",
+                    available.len(),
+                    loads
+                );
+                return None;
+            }
+        };
 
         if request_text.is_empty() {
             info!(
                 "Route: empty_text → {} load={} | {:.3}ms",
-                self.workers[min_idx].url(), self.workers[min_idx].load(),
+                self.workers[min_idx].url(),
+                self.workers[min_idx].load_display(),
                 start.elapsed().as_secs_f64() * 1000.0
             );
             return Some(min_idx);
@@ -160,8 +189,10 @@ impl CacheRouter {
                 .iter()
                 .position(|w| w.url() == match_result.tenant.as_ref());
 
-            if let Some(matched_worker_idx) = matched_worker_idx.filter(|idx| available.contains(idx)) {
-                let matched_load = self.workers[matched_worker_idx].load();
+            if let Some(matched_worker_idx) =
+                matched_worker_idx.filter(|idx| available.contains(idx))
+            {
+                let matched_load = self.workers[matched_worker_idx].effective_load();
 
                 // Check if the matched worker is itself imbalanced vs. the least-loaded
                 let matched_abs_diff = matched_load.saturating_sub(min_load);
@@ -171,15 +202,17 @@ impl CacheRouter {
                     f32::INFINITY
                 };
 
-                let matched_is_overloaded =
-                    matched_abs_diff >= self.config.balance_abs_threshold
-                        && matched_rel_ratio >= self.config.balance_rel_threshold;
+                let matched_is_overloaded = matched_abs_diff >= self.config.balance_abs_threshold
+                    && matched_rel_ratio >= self.config.balance_rel_threshold;
 
                 if matched_is_overloaded {
                     info!(
                         "Route: hit_overloaded → {} load={} | {}/{} {:.2} {:.3}ms",
-                        self.workers[min_idx].url(), self.workers[min_idx].load(),
-                        min_load, matched_load, matched_rel_ratio,
+                        self.workers[min_idx].url(),
+                        self.workers[min_idx].load_display(),
+                        min_load,
+                        matched_load,
+                        matched_rel_ratio,
                         start.elapsed().as_secs_f64() * 1000.0
                     );
                     metrics::record_load_balancing_event();
@@ -188,8 +221,11 @@ impl CacheRouter {
 
                 info!(
                     "Route: cache_hit → {} load={} | matched={}/{} {:.2} {:.3}ms",
-                    match_result.tenant, matched_load,
-                    match_result.matched_char_count, match_result.input_char_count, match_ratio,
+                    match_result.tenant,
+                    self.workers[matched_worker_idx].load_display(),
+                    match_result.matched_char_count,
+                    match_result.input_char_count,
+                    match_ratio,
                     start.elapsed().as_secs_f64() * 1000.0
                 );
                 metrics::record_cache_hit(&match_result.tenant);
@@ -206,8 +242,11 @@ impl CacheRouter {
         metrics::record_cache_miss();
         info!(
             "Route: cache_miss → {} load={} | matched={}/{} {:.2} {:.3}ms",
-            self.workers[min_idx].url(), self.workers[min_idx].load(),
-            match_result.matched_char_count, match_result.input_char_count, match_ratio,
+            self.workers[min_idx].url(),
+            self.workers[min_idx].load_display(),
+            match_result.matched_char_count,
+            match_result.input_char_count,
+            match_ratio,
             start.elapsed().as_secs_f64() * 1000.0
         );
 
@@ -222,10 +261,10 @@ impl CacheRouter {
         }
 
         let worker_url = self.workers[worker_idx].url();
-        if let Some(_guard) = self.eviction_lock.try_read_for(Duration::from_millis(100)) {
+        if let Some(_guard) = self.eviction_lock.try_read_for(Duration::from_secs(1)) {
             self.tree.insert(request_text, worker_url);
         } else {
-            warn!("Skipping tree insert: eviction lock held >100ms");
+            warn!("Skipping tree insert: eviction lock held >1s");
         }
         metrics::record_request_routed(worker_url);
     }
