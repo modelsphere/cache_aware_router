@@ -1,0 +1,7 @@
+apiVersion: v2
+name: cache_aware_router
+description: cache-aware-router(CART,k8s)——workers 由 autoconfig 从 ModelRoute 写进 config.yaml,reload sidecar 热更
+type: application
+version: 0.1.0
+appVersion: "v0.6.0"
+keywords: [cache-aware-router, routing, autoconfig]
