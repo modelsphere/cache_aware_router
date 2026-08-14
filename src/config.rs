@@ -81,6 +81,10 @@ pub struct ProxySection {
     pub backoff_multiplier: f32,
     pub jitter_factor: f32,
     pub request_timeout_secs: u64,
+    /// 仅约束「建立连接」耗时(TCP+TLS),与整体 request_timeout 独立。
+    /// k8s 死 pod IP=黑洞(SYN 被丢)时,不设则请求挂 ~30s(reqwest 内部连接超时;OS 默认更长
+    /// ~130s 但被 reqwest 先截断,实测 30s)。设 2s 快失败,不影响长流式生成(与整体 request_timeout 独立)。
+    pub connect_timeout_secs: u64,
     pub add_routed_peer_header: bool,
     pub max_body_size: usize,
     pub remote_media_url_policy: u16,
@@ -167,6 +171,7 @@ impl Default for ProxySection {
             backoff_multiplier: 2.0,
             jitter_factor: 0.25,
             request_timeout_secs: 10000,
+            connect_timeout_secs: 2,
             add_routed_peer_header: false,
             max_body_size: 10 * 1024 * 1024,
             remote_media_url_policy: 200,
@@ -212,6 +217,10 @@ pub struct ProxyConfig {
     pub backoff_multiplier: f32,
     pub jitter_factor: f32,
     pub request_timeout_secs: u64,
+    /// 仅约束「建立连接」耗时(TCP+TLS),与整体 request_timeout 独立。
+    /// k8s 死 pod IP=黑洞(SYN 被丢)时,不设则请求挂 ~30s(reqwest 内部连接超时;OS 默认更长
+    /// ~130s 但被 reqwest 先截断,实测 30s)。设 2s 快失败,不影响长流式生成(与整体 request_timeout 独立)。
+    pub connect_timeout_secs: u64,
     pub add_routed_peer_header: bool,
     pub max_body_size: usize,
     pub remote_media_url_policy: u16,
@@ -306,6 +315,7 @@ impl AppConfig {
             backoff_multiplier: self.proxy.backoff_multiplier,
             jitter_factor: self.proxy.jitter_factor,
             request_timeout_secs: self.proxy.request_timeout_secs,
+            connect_timeout_secs: self.proxy.connect_timeout_secs,
             add_routed_peer_header: self.proxy.add_routed_peer_header,
             max_body_size: self.proxy.max_body_size,
             remote_media_url_policy: self.proxy.remote_media_url_policy,

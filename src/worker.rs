@@ -36,6 +36,7 @@ impl Drop for LoadGuard {
 static HEALTH_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
+        .connect_timeout(std::time::Duration::from_secs(2))
         .build()
         .expect("Failed to create health check HTTP client")
 });
