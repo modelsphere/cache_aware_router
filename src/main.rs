@@ -90,6 +90,7 @@ async fn main() {
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(32)
         .pool_idle_timeout(Duration::from_secs(90))
+        .connect_timeout(Duration::from_secs(config.proxy.connect_timeout_secs))
         .build()
         .expect("Failed to create HTTP client");
 
