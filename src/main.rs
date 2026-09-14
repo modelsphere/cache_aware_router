@@ -133,7 +133,7 @@ async fn main() {
 }
 
 fn spawn_reload_handler(
-    config_path: PathBuf,
+    config_path: Vec<PathBuf>,
     router: Arc<ArcSwap<CacheRouter>>,
     current_config: Arc<parking_lot::Mutex<AppConfig>>,
     health_stop: Arc<AtomicBool>,

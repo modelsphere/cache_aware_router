@@ -1,7 +1,7 @@
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::fs::File;
+use std::path::{PathBuf};
 use std::time::Duration;
 
 /// Minimal CLI: just the config file path and optional validation flag.
@@ -10,8 +10,8 @@ use std::time::Duration;
 #[command(about = "Minimal cache-aware reverse proxy for vLLM services")]
 pub struct CliArgs {
     /// Path to YAML configuration file
-    #[arg(short, long, default_value = "config.yaml")]
-    pub config: PathBuf,
+    #[arg(short, long, action = clap::ArgAction::Append, default_values = &["config.yaml"])]
+    pub config: Vec<PathBuf>,
 
     /// Validate config and exit without starting the server
     #[arg(long)]
@@ -19,7 +19,7 @@ pub struct CliArgs {
 }
 
 /// Root config deserialized from YAML.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     #[serde(default)]
@@ -234,12 +234,36 @@ pub struct HealthConfig {
     pub success_threshold: u32,
 }
 
+fn merge_yaml(left: &mut serde_yaml::Value, right: serde_yaml::Value) {
+    match (left, right) {
+        (serde_yaml::Value::Mapping(ref mut map_left), serde_yaml::Value::Mapping(map_right)) => {
+            for (k, v) in map_right {
+                map_left
+                    .entry(k)
+                    .and_modify(|l| merge_yaml(l, v.clone()))
+                    .or_insert(v);
+            }
+        }
+        (l, r) => {
+            *l = r; // Override non-mapping values with the newer file's values
+        }
+    }
+}
+
 impl AppConfig {
-    pub fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let contents = fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read config file '{}': {}", path.display(), e))?;
-        let config: AppConfig = serde_yaml::from_str(&contents)
-            .map_err(|e| format!("Failed to parse config file '{}': {}", path.display(), e))?;
+    pub fn load(path_vec: &[PathBuf]) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut merged_raw = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+
+        for path in path_vec {
+            let file = File::open(path)?;
+            let val: serde_yaml::Value = serde_yaml::from_reader(file)?;
+
+            // Uses the dynamic merge function we wrote earlier
+            merge_yaml(&mut merged_raw, val);
+        }
+
+        let config: AppConfig = serde_yaml::from_value(merged_raw)
+            .map_err(|e| format!("Failed to parse config: {}", e))?;
         config.validate()?;
         Ok(config)
     }
@@ -411,7 +435,7 @@ workers:
         file.write_all(yaml.as_bytes()).unwrap();
         file.flush().unwrap();
 
-        let config = AppConfig::load(file.path()).unwrap();
+        let config = AppConfig::load(&[file.path().to_path_buf()]).unwrap();
         assert_eq!(config.workers.len(), 1);
         assert_eq!(config.workers[0].url, "http://localhost:8050");
         assert_eq!(config.workers[0].max_load, 20);
@@ -464,7 +488,7 @@ logging:
         file.write_all(yaml.as_bytes()).unwrap();
         file.flush().unwrap();
 
-        let config = AppConfig::load(file.path()).unwrap();
+        let config = AppConfig::load(&[file.path().to_path_buf()]).unwrap();
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.port, 9090);
         assert_eq!(config.workers.len(), 2);
@@ -489,7 +513,7 @@ server:
         file.write_all(yaml.as_bytes()).unwrap();
         file.flush().unwrap();
 
-        let result = AppConfig::load(file.path());
+        let result = AppConfig::load(&[file.path().to_path_buf()]);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -506,7 +530,7 @@ workers: []
         file.write_all(yaml.as_bytes()).unwrap();
         file.flush().unwrap();
 
-        let result = AppConfig::load(file.path());
+        let result = AppConfig::load(&[file.path().to_path_buf()]);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -524,7 +548,7 @@ workers:
         file.write_all(yaml.as_bytes()).unwrap();
         file.flush().unwrap();
 
-        let result = AppConfig::load(file.path());
+        let result = AppConfig::load(&[file.path().to_path_buf()]);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("must start with"));
     }
@@ -540,7 +564,7 @@ workers:
         file.write_all(yaml.as_bytes()).unwrap();
         file.flush().unwrap();
 
-        let result = AppConfig::load(file.path());
+        let result = AppConfig::load(&[file.path().to_path_buf()]);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -559,7 +583,7 @@ unknown_field: "value"
         file.write_all(yaml.as_bytes()).unwrap();
         file.flush().unwrap();
 
-        let result = AppConfig::load(file.path());
+        let result = AppConfig::load(&[file.path().to_path_buf()]);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("unknown field"));
     }
@@ -576,7 +600,7 @@ cache:
         file.write_all(yaml.as_bytes()).unwrap();
         file.flush().unwrap();
 
-        let result = AppConfig::load(file.path());
+        let result = AppConfig::load(&[file.path().to_path_buf()]);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -603,7 +627,7 @@ health:
         file.write_all(yaml.as_bytes()).unwrap();
         file.flush().unwrap();
 
-        let config = AppConfig::load(file.path()).unwrap();
+        let config = AppConfig::load(&[file.path().to_path_buf()]).unwrap();
 
         let cache_config = config.cache_config();
         assert_eq!(cache_config.cache_threshold, 0.4);
@@ -637,8 +661,8 @@ workers:
         f2.write_all(yaml2.as_bytes()).unwrap();
         f2.flush().unwrap();
 
-        let c1 = AppConfig::load(f1.path()).unwrap();
-        let c2 = AppConfig::load(f2.path()).unwrap();
+        let c1 = AppConfig::load(&[f1.path().to_path_buf()]).unwrap();
+        let c2 = AppConfig::load(&[f2.path().to_path_buf()]).unwrap();
         assert!(c1.validate_reload_compatibility(&c2).is_ok());
     }
 
@@ -663,8 +687,8 @@ cache:
         f2.write_all(yaml2.as_bytes()).unwrap();
         f2.flush().unwrap();
 
-        let c1 = AppConfig::load(f1.path()).unwrap();
-        let c2 = AppConfig::load(f2.path()).unwrap();
+        let c1 = AppConfig::load(&[f1.path().to_path_buf()]).unwrap();
+        let c2 = AppConfig::load(&[f2.path().to_path_buf()]).unwrap();
         let err = c1.validate_reload_compatibility(&c2).unwrap_err();
         assert!(err.contains("cache config changed"));
     }
@@ -690,8 +714,8 @@ server:
         f2.write_all(yaml2.as_bytes()).unwrap();
         f2.flush().unwrap();
 
-        let c1 = AppConfig::load(f1.path()).unwrap();
-        let c2 = AppConfig::load(f2.path()).unwrap();
+        let c1 = AppConfig::load(&[f1.path().to_path_buf()]).unwrap();
+        let c2 = AppConfig::load(&[f2.path().to_path_buf()]).unwrap();
         let err = c1.validate_reload_compatibility(&c2).unwrap_err();
         assert!(err.contains("server config changed"));
     }
@@ -706,7 +730,7 @@ workers:
         file.write_all(yaml.as_bytes()).unwrap();
         file.flush().unwrap();
 
-        let config = AppConfig::load(file.path()).unwrap();
+        let config = AppConfig::load(&[file.path().to_path_buf()]).unwrap();
         assert_eq!(config.proxy.remote_media_url_policy, 200);
     }
 
@@ -722,7 +746,7 @@ proxy:
         file.write_all(yaml.as_bytes()).unwrap();
         file.flush().unwrap();
 
-        let config = AppConfig::load(file.path()).unwrap();
+        let config = AppConfig::load(&[file.path().to_path_buf()]).unwrap();
         assert_eq!(config.proxy.remote_media_url_policy, 400);
     }
 
@@ -738,7 +762,7 @@ proxy:
         file.write_all(yaml.as_bytes()).unwrap();
         file.flush().unwrap();
 
-        let config = AppConfig::load(file.path()).unwrap();
+        let config = AppConfig::load(&[file.path().to_path_buf()]).unwrap();
         assert_eq!(config.proxy.remote_media_url_policy, 500);
     }
 
@@ -754,7 +778,7 @@ proxy:
         file.write_all(yaml.as_bytes()).unwrap();
         file.flush().unwrap();
 
-        let result = AppConfig::load(file.path());
+        let result = AppConfig::load(&[file.path().to_path_buf()]);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -774,7 +798,7 @@ proxy:
         file.write_all(yaml.as_bytes()).unwrap();
         file.flush().unwrap();
 
-        let result = AppConfig::load(file.path());
+        let result = AppConfig::load(&[file.path().to_path_buf()]);
         assert!(result.is_err());
     }
 }
