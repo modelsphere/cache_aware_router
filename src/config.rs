@@ -1,7 +1,7 @@
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::path::{PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Minimal CLI: just the config file path and optional validation flag.
@@ -9,8 +9,9 @@ use std::time::Duration;
 #[command(name = "cache-aware-router")]
 #[command(about = "Minimal cache-aware reverse proxy for vLLM services")]
 pub struct CliArgs {
-    /// Path to YAML configuration file
-    #[arg(short, long, action = clap::ArgAction::Append, default_values = &["config.yaml"])]
+    /// Path to YAML configuration file. Repeatable: files are layered in the
+    /// order given, later files win (see `AppConfig::load`).
+    #[arg(short, long, default_values = &["config.yaml"])]
     pub config: Vec<PathBuf>,
 
     /// Validate config and exit without starting the server
@@ -19,7 +20,7 @@ pub struct CliArgs {
 }
 
 /// Root config deserialized from YAML.
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     #[serde(default)]
@@ -234,14 +235,25 @@ pub struct HealthConfig {
     pub success_threshold: u32,
 }
 
+/// Merge `right` onto `left` in place.
+///
+/// Mappings are merged key by key (recursively); sequences and scalars are
+/// replaced wholesale, so a later file listing `workers` replaces the whole
+/// list rather than appending to it. A null `right` — what an empty or
+/// comment-only file parses to — leaves `left` untouched instead of wiping it.
 fn merge_yaml(left: &mut serde_yaml::Value, right: serde_yaml::Value) {
+    if right.is_null() {
+        return;
+    }
     match (left, right) {
-        (serde_yaml::Value::Mapping(ref mut map_left), serde_yaml::Value::Mapping(map_right)) => {
+        (serde_yaml::Value::Mapping(map_left), serde_yaml::Value::Mapping(map_right)) => {
             for (k, v) in map_right {
-                map_left
-                    .entry(k)
-                    .and_modify(|l| merge_yaml(l, v.clone()))
-                    .or_insert(v);
+                match map_left.entry(k) {
+                    serde_yaml::mapping::Entry::Occupied(mut slot) => merge_yaml(slot.get_mut(), v),
+                    serde_yaml::mapping::Entry::Vacant(slot) => {
+                        slot.insert(v);
+                    }
+                }
             }
         }
         (l, r) => {
@@ -251,19 +263,32 @@ fn merge_yaml(left: &mut serde_yaml::Value, right: serde_yaml::Value) {
 }
 
 impl AppConfig {
-    pub fn load(path_vec: &[PathBuf]) -> Result<Self, Box<dyn std::error::Error>> {
+    /// Load and layer every path in order: later files win, mappings merge
+    /// recursively, sequences and scalars replace (see [`merge_yaml`]).
+    pub fn load(paths: &[PathBuf]) -> Result<Self, Box<dyn std::error::Error>> {
         let mut merged_raw = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
 
-        for path in path_vec {
-            let file = File::open(path)?;
-            let val: serde_yaml::Value = serde_yaml::from_reader(file)?;
-
-            // Uses the dynamic merge function we wrote earlier
+        for path in paths {
+            let file = File::open(path)
+                .map_err(|e| format!("Failed to read config file '{}': {}", path.display(), e))?;
+            let val: serde_yaml::Value = serde_yaml::from_reader(file)
+                .map_err(|e| format!("Failed to parse config file '{}': {}", path.display(), e))?;
+            if !val.is_null() && !val.is_mapping() {
+                return Err(format!(
+                    "Config file '{}' must contain a YAML mapping at the top level",
+                    path.display()
+                )
+                .into());
+            }
             merge_yaml(&mut merged_raw, val);
         }
 
-        let config: AppConfig = serde_yaml::from_value(merged_raw)
-            .map_err(|e| format!("Failed to parse config: {}", e))?;
+        // Schema errors are reported against the merged tree, so name every
+        // file that fed into it — no single file has the offending line.
+        let config: AppConfig = serde_yaml::from_value(merged_raw).map_err(|e| {
+            let names: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+            format!("Failed to parse config [{}]: {}", names.join(", "), e)
+        })?;
         config.validate()?;
         Ok(config)
     }
@@ -800,5 +825,145 @@ proxy:
 
         let result = AppConfig::load(&[file.path().to_path_buf()]);
         assert!(result.is_err());
+    }
+
+    // ---- multi-file layering (`--config a --config b`) ----
+
+    #[test]
+    fn test_config_flag_is_repeatable() {
+        // clap_derive infers ArgAction::Append from the `Vec<PathBuf>` field
+        // type, so no explicit `action = ...` is needed. Pin that here: with
+        // ArgAction::Set the second -c would overwrite the first.
+        let args = CliArgs::parse_from(["cache-aware-router", "-c", "a.yaml", "-c", "b.yaml"]);
+        assert_eq!(
+            args.config,
+            vec![PathBuf::from("a.yaml"), PathBuf::from("b.yaml")]
+        );
+
+        let defaulted = CliArgs::parse_from(["cache-aware-router"]);
+        assert_eq!(defaulted.config, vec![PathBuf::from("config.yaml")]);
+    }
+
+    fn tmp_yaml(contents: &str) -> NamedTempFile {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(contents.as_bytes()).unwrap();
+        file.flush().unwrap();
+        file
+    }
+
+    const BASE_YAML: &str = r#"
+server:
+  host: "127.0.0.1"
+  port: 9090
+workers:
+  - url: "http://node1:8050"
+    max_load: 10
+  - url: "http://node2:8050"
+cache:
+  threshold: 0.5
+  max_tree_size: 131072
+"#;
+
+    #[test]
+    fn test_merge_later_file_overrides_scalars() {
+        let base = tmp_yaml(BASE_YAML);
+        let overlay = tmp_yaml("server:\n  port: 7000\nlogging:\n  level: \"debug\"\n");
+
+        let config =
+            AppConfig::load(&[base.path().to_path_buf(), overlay.path().to_path_buf()]).unwrap();
+        assert_eq!(config.server.port, 7000);
+        // Keys the overlay does not mention survive, at every depth.
+        assert_eq!(config.server.host, "127.0.0.1");
+        assert_eq!(config.cache.threshold, 0.5);
+        assert_eq!(config.cache.max_tree_size, 131072);
+        assert_eq!(config.logging.level, "debug");
+    }
+
+    #[test]
+    fn test_merge_replaces_sequences_wholesale() {
+        let base = tmp_yaml(BASE_YAML);
+        let overlay = tmp_yaml("workers:\n  - url: \"http://node3:8050\"\n");
+
+        let config =
+            AppConfig::load(&[base.path().to_path_buf(), overlay.path().to_path_buf()]).unwrap();
+        assert_eq!(config.workers.len(), 1);
+        assert_eq!(config.workers[0].url, "http://node3:8050");
+    }
+
+    #[test]
+    fn test_merge_empty_overlay_is_a_noop() {
+        // A ConfigMap-mounted overlay that nothing has written yet must not
+        // wipe the base config.
+        let base = tmp_yaml(BASE_YAML);
+        for overlay_body in ["", "\n", "# nothing here yet\n"] {
+            let overlay = tmp_yaml(overlay_body);
+            let config =
+                AppConfig::load(&[base.path().to_path_buf(), overlay.path().to_path_buf()])
+                    .unwrap_or_else(|e| {
+                        panic!("empty overlay {:?} broke the merge: {}", overlay_body, e)
+                    });
+            assert_eq!(config.workers.len(), 2);
+            assert_eq!(config.server.port, 9090);
+        }
+    }
+
+    #[test]
+    fn test_merge_three_files_last_wins() {
+        let base = tmp_yaml(BASE_YAML);
+        let mid = tmp_yaml("server:\n  port: 7000\n");
+        let top = tmp_yaml("server:\n  port: 8000\n");
+
+        let config = AppConfig::load(&[
+            base.path().to_path_buf(),
+            mid.path().to_path_buf(),
+            top.path().to_path_buf(),
+        ])
+        .unwrap();
+        assert_eq!(config.server.port, 8000);
+    }
+
+    #[test]
+    fn test_missing_file_error_names_the_path() {
+        let base = tmp_yaml(BASE_YAML);
+        let missing = PathBuf::from("/nonexistent/cart-overlay.yaml");
+
+        let err = AppConfig::load(&[base.path().to_path_buf(), missing])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cart-overlay.yaml"),
+            "error lost the path: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_error_names_the_file() {
+        let base = tmp_yaml(BASE_YAML);
+        let broken = tmp_yaml("server:\n  port: [unclosed\n");
+
+        let err = AppConfig::load(&[base.path().to_path_buf(), broken.path().to_path_buf()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&broken.path().display().to_string()),
+            "error lost the path: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_non_mapping_root_rejected() {
+        let base = tmp_yaml(BASE_YAML);
+        let scalar = tmp_yaml("just-a-string\n");
+
+        let err = AppConfig::load(&[base.path().to_path_buf(), scalar.path().to_path_buf()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("must contain a YAML mapping"),
+            "unexpected error: {}",
+            err
+        );
     }
 }

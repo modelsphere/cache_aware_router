@@ -38,12 +38,16 @@ baseConfig: |
     host: "0.0.0.0"
     port: 8071
   cache:
-    threshold: 0.3
+    threshold: 0.1
+    balance_abs_threshold: 10
+    max_tree_size: 5000000
+    daily_cleanup_hour_utc: 21
+  proxy:
+    add_routed_peer_header: true
+    remote_media_url_policy: 400
   health:
     endpoint: "/health"
     interval_secs: 10
-  proxy:
-    add_routed_peer_header: true   # 回 x-routed-peer 头 → openresty forwarded_to 得真实后端 → bodylog 按后端聚合 → monitor per-model TPM 生效(其余 proxy 字段 serde 默认,含 connect_timeout_secs=2)
   workers: []
 
 # launch_service 要求 ulimit -n ≥ 65535
@@ -60,11 +64,13 @@ service:
 
 resources:
   requests: { cpu: 200m, memory: 256Mi }
-  limits: { cpu: "4", memory: 4Gi }
+  limits: { cpu: "4", memory: 16Gi }
 
 podAnnotations: {}
 nodeSelector: {}
 tolerations: []
+# 与 ha.enabled 的「主备分散到不同节点」叠加,不是替换:这里只写 nodeAffinity 时,
+# 那条 podAntiAffinity 仍在。自己写 podAntiAffinity 才会覆盖它。
 affinity: {}
 nameOverride: ""
 fullnameOverride: ""

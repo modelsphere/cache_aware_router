@@ -255,8 +255,10 @@ pub async fn heap_purge_handler() -> Response {
         }
     }
 
-    // Also do malloc_trim for any glibc-held pages
-    unsafe { libc::malloc_trim(0); }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::malloc_trim(0);
+    }
 
     let _ = epoch::advance();
     let after_resident = stats::resident::read().unwrap_or(0);

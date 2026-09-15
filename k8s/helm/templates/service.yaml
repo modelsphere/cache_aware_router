@@ -1,14 +1,15 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "cache_aware_router.fullname" . }}
-  labels: {{- include "cache_aware_router.labels" . | nindent 4 }}
+  name: {{ include "cart.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "cart.labels" . | nindent 4 }}
 spec:
   type: {{ .Values.service.type }}
   selector:
-    {{- include "cache_aware_router.selectorLabels" . | nindent 4 }}
+    {{- include "cart.selectorLabels" . | nindent 4 }}
     {{- if .Values.ha.enabled }}
-    {{ include "cache_aware_router.name" . }}-active: "true"   # 只选 leader pod(ha-gate 打的 active 标签)
+    {{ include "cart.name" . }}-active: "true"   # 只选 leader pod(ha-gate 打的 active 标签)
     {{- end }}
   ports:
     - name: http

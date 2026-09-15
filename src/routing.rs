@@ -76,7 +76,7 @@ impl CacheRouter {
                         let _guard = lock_clone.write();
                         tree_clone.evict_tenant_by_size(effective_size);
                     }
-                    #[cfg(target_os = "linux")]
+                    #[cfg(all(target_os = "linux", target_env = "gnu"))]
                     unsafe {
                         libc::malloc_trim(0);
                     }
