@@ -25,13 +25,13 @@ podDisruptionBudget:
   enabled: true
   minAvailable: 1
 
-# CART 配置 ConfigMap(config.yaml):chart 建**唯一底稿**(server/cache/health),autoconfig 只重填 workers 段。
+# CART 配置 ConfigMap(config.yaml):chart 建**底稿**(server/cache/health),autoconfig 只重填 workers 段。
 # 这就是 CART 的 base——per-model 的 port/cache 等直接改这里(每个模型一个 cart release)。不再有单独的 baseConfigRef。
 # ⚠️ cart 是【一个模型一个】,此 CM 也按模型独立。名字默认 = <fullname>-config(按 release 唯一,多 cart 同 ns 不撞);
-#    ModelRoute.cart.outputConfigMap 必须指到这个名。留空用默认,或显式覆盖。
+#    ModelRoute.cart.outputConfigMap 指到这个名,或指到某个覆盖层 CM(见 extraConfigs)。
 configMapName: ""
 
-# 底稿 config.yaml(server/cache/health + 占位 workers)。autoconfig 保留这部分、只替换 workers:;
+# 底稿 config.yaml(server/cache/health)。workers 由 autoconfig 写(落点是本 CM 或某个覆盖层 CM);
 # standalone(无 autoconfig)时可在此直接写死 workers。
 baseConfig: |
   server:
@@ -48,7 +48,19 @@ baseConfig: |
   health:
     endpoint: "/health"
     interval_secs: 10
-  workers: []
+
+# 覆盖层:底稿之外再挂 N 个 ConfigMap,按序追加 `-c`。后者覆盖前者:mapping 逐键合并,list/标量整体替换,
+# 空文件不生效。每条二选一:content(chart 建 CM,名 <fullname>-cfg-<name>)| existingConfigMap(引用已有)。
+# autoconfig: true 标 autoconfig 落点(最多一条),ModelRoute.cart.outputConfigMap 指它、reload 也 watch 它;
+# 不标则沿用底稿,与加覆盖层前一致。workers 之外的改动不热更(reload 只收 workers),需 rollout restart。
+extraConfigs: []
+#   - name: workers          # 小写字母/数字/中划线;用作卷名、挂载目录、生成的 CM 名后缀
+#     autoconfig: true
+#     content: ""            # 先建空 CM,等 autoconfig 写 workers
+#   - name: shared
+#     existingConfigMap: cart-shared-proxy
+#     key: overrides.yaml    # 默认 config.yaml
+#     optional: false        # 默认 false;true 时 CM 缺失 → 文件不存在 → cart 启动报错
 
 # launch_service 要求 ulimit -n ≥ 65535
 ulimitNofile: 65535
@@ -57,6 +69,7 @@ reload:
   enabled: true
   image: harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.31
   process: "cache-aware-router"
+  watchPaths: []   # 留空 = autoconfig 那条覆盖层的目录;没标则 /workspace/configs。填多个会渲染多个 --watch
 
 service:
   type: ClusterIP
