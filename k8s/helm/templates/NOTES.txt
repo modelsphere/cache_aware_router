@@ -1,20 +1,17 @@
 cache-aware-router 已部署({{ include "cart.fullname" . }})。
 
 镜像: {{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
-底稿 ConfigMap:{{ include "cart.configMapName" . }}(chart 建 config.yaml 初值,挂到 /workspace/configs)
-{{- if .Values.extraConfigs }}
-覆盖层(按此顺序追加 -c,后者覆盖前者):
-{{- range $i, $e := .Values.extraConfigs }}
-{{- $r := include "cart.extraConfig.resolve" (list $ $e $i) | fromYaml }}
-  {{ $i | add1 }}. {{ $r.configMap }}[{{ $r.key }}] → {{ $r.file }}{{ if $r.inline }}(本 chart 建){{ else }}(引用已有 CM){{ end }}{{ if $r.autoconfig }}  ← autoconfig 落点{{ end }}
+配置 ConfigMap:{{ include "cart.configMapName" . }}(挂到 /workspace/configs),加载顺序:
+  config.yaml(底稿,chart 建)
+{{- range .Values.configOverlays }}
+  {{ .key }}{{ if .autoconfig }}(autoconfig 写;ModelRoute.cart.outputKey 设成 {{ .key }}){{ else }}(chart 建){{ end }}
 {{- end }}
-  ⚠️ workers 之外的改动不热更,要 kubectl rollout restart deploy/{{ include "cart.fullname" . }}
-{{- end }}
+  后者覆盖前者。workers 之外的改动不热更,要 kubectl rollout restart deploy/{{ include "cart.fullname" . }}
 {{- if .Values.reload.enabled }}
-reload: sidecar autoconfig-reload watch {{ include "cart.reload.watchPaths" . | fromYamlArray | join ", " }} → SIGHUP cache-aware-router(热更 workers)
+reload: sidecar autoconfig-reload watch /workspace/configs → SIGHUP cache-aware-router(热更 workers)
 {{- end }}
 Service :{{ .Values.service.port }}(需与 ModelRoute.cart.port 一致)
 
 配置更新(不冲突):
-  - autoconfig:往 ModelRoute.cart.outputConfigMap 指的 CM(底稿或某条覆盖层)写/更新 workers;
-  - 手动:kubectl edit 对应 CM,或改 values 后 helm upgrade(三方合并不覆盖 live 值)。
+  - autoconfig:往 ModelRoute.cart.outputConfigMap/outputKey 指的 key 写 workers;
+  - 手动:kubectl edit cm {{ include "cart.configMapName" . }},或改 values 后 helm upgrade。

@@ -1,4 +1,4 @@
-{{- include "cart.extraConfigs.check" . }}
+{{- include "cart.configOverlays.check" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -33,7 +33,9 @@ spec:
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           # 扫底稿 + 覆盖层全部文件(autoconfig 落点可能是其中任一个)。正则别收紧到 [[:space:]]*http:带引号的 url 会漏。
           command: ["sh", "-c", "for i in $(seq 1 300); do grep -qE 'url:.*http' {{ include "cart.configFiles" . }} 2>/dev/null && { echo 'workers ready'; exit 0; }; echo \"[$i] 等 autoconfig 写 workers...\"; sleep 2; done; echo 'timeout, 仍放行'; exit 0"]
-          volumeMounts: {{- include "cart.configVolumeMounts" . | nindent 12 }}
+          volumeMounts:
+            - name: cfg
+              mountPath: /workspace/configs
       {{- end }}
       containers:
         - name: cart
@@ -43,14 +45,15 @@ spec:
           args:                         # 加载顺序 = 覆盖顺序,后者覆盖前者
             - "-c"
             - "/workspace/configs/config.yaml"
-            {{- range $i, $e := .Values.extraConfigs }}
-            {{- $r := include "cart.extraConfig.resolve" (list $ $e $i) | fromYaml }}
+            {{- range .Values.configOverlays }}
             - "-c"
-            - {{ $r.file | quote }}
+            - {{ printf "/workspace/configs/%s" .key | quote }}
             {{- end }}
           ports:
             - containerPort: {{ .Values.service.port }}
-          volumeMounts: {{- include "cart.configVolumeMounts" . | nindent 12 }}
+          volumeMounts:
+            - name: cfg               # 底稿 + 各 overlay key,整卷挂到 /workspace/configs
+              mountPath: /workspace/configs
           {{- if .Values.probes.enabled }}
           startupProbe:                 # 慢启动预算:端口起来前不判 live/ready(最多 ~60s)
             tcpSocket: { port: {{ .Values.service.port }} }
@@ -69,14 +72,10 @@ spec:
         {{- if .Values.reload.enabled }}
         - name: reload
           image: {{ .Values.reload.image }}
-          args:                       # watch autoconfig 的落点(见 values.reload.watchPaths)
-            {{- range (include "cart.reload.watchPaths" . | fromYamlArray) }}
-            - "--watch"
-            - {{ . | quote }}
-            {{- end }}
-            - "--process"
-            - {{ .Values.reload.process | quote }}
-          volumeMounts: {{- include "cart.configVolumeMounts" . | nindent 12 }}
+          args: ["--watch", "/workspace/configs", "--process", {{ .Values.reload.process | quote }}]
+          volumeMounts:
+            - name: cfg
+              mountPath: /workspace/configs
         {{- end }}
         {{- if .Values.ha.enabled }}
         - name: hagate                  # master-standby:只有 leader 给自己打 cart-active 标签 → 只有它进 Service
@@ -92,19 +91,7 @@ spec:
       volumes:
         - name: cfg
           configMap:
-            name: {{ include "cart.configMapName" . }}   # 底稿:chart 建初值,autoconfig 可更新
-        {{- range $i, $e := .Values.extraConfigs }}
-        {{- $r := include "cart.extraConfig.resolve" (list $ $e $i) | fromYaml }}
-        - name: {{ $r.volume }}
-          configMap:
-            name: {{ $r.configMap }}
-            items:
-              - key: {{ $r.key }}
-                path: {{ $r.key }}
-            {{- if $r.optional }}
-            optional: true   # CM 缺失 → 文件不存在 → cart 启动报错退出
-            {{- end }}
-        {{- end }}
+            name: {{ include "cart.configMapName" . }}   # chart 建底稿 + overlay key,autoconfig 填它那个 key
       {{- /* 自定义 affinity 与「主备分散」是叠加关系,不是二选一:只写 nodeAffinity
              (把 CART 钉到某类节点)时,下面的 podAntiAffinity 仍然保留 —— 否则 2 个
              副本可能落到同一台,主备 HA 就白做了。要改/关掉分散,自己写一份
