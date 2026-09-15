@@ -1,5 +1,12 @@
 # Cache-Aware Router Configuration
 # Only 'workers' is required. All other fields show their defaults.
+#
+# --config is repeatable (e.g. -c base.yaml -c overlay.yaml). Files are layered
+# in the order given and the last one wins:
+#   - mappings merge key by key, so an overlay only needs the keys it changes;
+#   - lists and scalars are replaced wholesale, so an overlay that names
+#     'workers' replaces the entire list rather than appending to it;
+#   - an empty or comment-only file changes nothing.
 
 server:
   host: "0.0.0.0"

@@ -11,4 +11,9 @@ cat /proc/cpuinfo | tail -n 50
 export
 date
 
-exec ./cache-aware-router -c configs/config.yaml
+# 有参数就透传(chart 传 `-c 底稿 -c 覆盖层 ...`),没参数维持单文件默认。
+if [ "$#" -gt 0 ]; then
+    exec ./cache-aware-router "$@"
+else
+    exec ./cache-aware-router -c configs/config.yaml
+fi

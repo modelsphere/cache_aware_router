@@ -1,13 +1,20 @@
-cache-aware-router 已部署({{ include "cache_aware_router.fullname" . }})。
+cache-aware-router 已部署({{ include "cart.fullname" . }})。
 
 镜像: {{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
-配置 ConfigMap:{{ include "cache_aware_router.configMapName" . }}(本 chart 建 config.yaml 初值,挂到 /workspace/configs)
+底稿 ConfigMap:{{ include "cart.configMapName" . }}(chart 建 config.yaml 初值,挂到 /workspace/configs)
+{{- if .Values.extraConfigs }}
+覆盖层(按此顺序追加 -c,后者覆盖前者):
+{{- range $i, $e := .Values.extraConfigs }}
+{{- $r := include "cart.extraConfig.resolve" (list $ $e $i) | fromYaml }}
+  {{ $i | add1 }}. {{ $r.configMap }}[{{ $r.key }}] → {{ $r.file }}{{ if $r.inline }}(本 chart 建){{ else }}(引用已有 CM){{ end }}{{ if $r.autoconfig }}  ← autoconfig 落点{{ end }}
+{{- end }}
+  ⚠️ workers 之外的改动不热更,要 kubectl rollout restart deploy/{{ include "cart.fullname" . }}
+{{- end }}
 {{- if .Values.reload.enabled }}
-reload: sidecar autoconfig-reload watch → SIGHUP cache-aware-router(热更 workers)
+reload: sidecar autoconfig-reload watch {{ include "cart.reload.watchPaths" . | fromYamlArray | join ", " }} → SIGHUP cache-aware-router(热更 workers)
 {{- end }}
 Service :{{ .Values.service.port }}(需与 ModelRoute.cart.port 一致)
 
-配置更新两种方式(不冲突):
-  - autoconfig(可选):有 ModelRoute(cart.outputConfigMap={{ include "cache_aware_router.configMapName" . }})时自动写/更新 workers;
-  - 手动:kubectl edit cm {{ include "cache_aware_router.configMapName" . }} 改 workers(standalone 模式在 values.baseConfig 写死)。
-  Helm upgrade 三方合并不会覆盖 autoconfig/手动写的 config.yaml。
+配置更新(不冲突):
+  - autoconfig:往 ModelRoute.cart.outputConfigMap 指的 CM(底稿或某条覆盖层)写/更新 workers;
+  - 手动:kubectl edit 对应 CM,或改 values 后 helm upgrade(三方合并不覆盖 live 值)。

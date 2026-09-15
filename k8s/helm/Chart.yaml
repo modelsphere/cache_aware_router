@@ -1,7 +1,22 @@
 apiVersion: v2
-name: cache_aware_router
+# Renamed from upstream's `cache_aware_router`: that name has underscores, and
+# the default fullname (`<release>-cache_aware_router`) is not a valid RFC 1123
+# resource name, so a standalone install only ever worked with a nameOverride.
+# `cart` renders valid by default and is the values key the parent chart gates
+# on (cart.enabled).
+name: cart
 description: cache-aware-router(CART,k8s)——workers 由 autoconfig 从 ModelRoute 写进 config.yaml,reload sidecar 热更
 type: application
-version: 0.1.2
+version: 0.2.0
 appVersion: "v0.6.2-k8s"
 keywords: [cache-aware-router, routing, autoconfig]
+# Vendored from cache_aware_router.git k8s/helm at chart version 0.1.2. Kept as a
+# subchart rather than a dependency because CART is per-model: one CART belongs
+# to exactly one model, so its lifecycle is this release's lifecycle. Re-vendor
+# by copying k8s/helm over this directory and re-applying the three local
+# changes:
+#   1. this chart name (see above)
+#   2. the cache_aware_router.* -> cart.* helper prefix throughout templates/
+#   3. metadata.namespace: {{ .Release.Namespace }} on every resource, so the
+#      rendered manifests are correct when applied outside `helm install` too
+#      (helm sets the namespace on the API request, not in the YAML)
