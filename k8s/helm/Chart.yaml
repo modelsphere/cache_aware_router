@@ -8,7 +8,7 @@ name: cart
 description: cache-aware-router(CART,k8s)——workers 由 autoconfig 从 ModelRoute 写进 config.yaml,reload sidecar 热更
 type: application
 version: 0.2.0
-appVersion: "v0.6.2-k8s"
+appVersion: "v0.6.4"
 keywords: [cache-aware-router, routing, autoconfig]
 # Vendored from cache_aware_router.git k8s/helm at chart version 0.1.2. Kept as a
 # subchart rather than a dependency because CART is per-model: one CART belongs
