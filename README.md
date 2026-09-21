@@ -236,13 +236,22 @@ a pass runs long.
 
 ## Kubernetes
 
-`k8s/helm/` contains a Helm chart. Note that its defaults assume a controller is
-managing the worker list and reloading CART for you:
+CART is packaged as a Helm chart, published from the
+[helm-charts](https://github.com/project-modelpilot/helm-charts) repository
+rather than from here:
+
+```bash
+helm repo add modelpilot https://project-modelpilot.github.io/helm-charts
+helm install my-cart modelpilot/cart
+```
+
+The chart's defaults assume a controller is managing the worker list and
+reloading CART for you:
 
 - `waitForWorkers: true` holds the pod in `Init` until the config has workers;
 - `reload.enabled: true` adds a sidecar that sends `SIGHUP` on config change;
 - `ha.enabled: true` adds a leader-election sidecar so only one replica takes
-  traffic — CART's cache is local, and an active-active pair splits it in half.
+  traffic -- CART's cache is local, and an active-active pair splits it in half.
 
 For a standalone install with a hand-written worker list, set all three to
 `false` and put `workers` directly in `baseConfig`.

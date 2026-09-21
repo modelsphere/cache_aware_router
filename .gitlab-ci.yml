@@ -17,6 +17,7 @@
 # DOCKER_BUILDKIT=0:出简单 v2 manifest,containerd 直接拉(避 buildkit attestation)。
 #
 # 触发:仅打 git tag(如 v0.6.1)。产物 harbor.4pd.io/hardcore-tech/cache_aware_router:<tag> (+ :latest)。
+# 本仓【不再出 helm chart】—— chart 已移到 helm-charts 仓的 charts/cart,由那边统一发布。
 # 生效前提:本文件要在【被打 tag 的 commit】上(先合进 master),再打 tag。
 
 stages: [build]
@@ -40,25 +41,3 @@ build:image:
       -t "$IMAGE:$CI_COMMIT_TAG" -t "$IMAGE:latest" .
     - docker push "$IMAGE:$CI_COMMIT_TAG"
     - docker push "$IMAGE:latest"
-
-# helm chart 打包 + push,用 public-buildx runner 内置的 push-chart(org 标准,参考 llm-monitor CI 实测)。
-# push-chart 自处理 harbor ChartMuseum 鉴权(cm-push 到 harbor-chart-repo = https://harbor.4pd.io/chartrepo/hardcore-tech)。
-# ⚠️ cart 的 git tag 带前缀 v(如 v0.6.3-k8s)= 镜像 tag,但 helm chart version 必须是合法 SemVer2(不能带前导 v)
-#   → chart version = 去掉前导 v 的 tag;appVersion = 完整 tag(= 镜像 tag,含 v)。values.yaml image.tag="" 回落 appVersion。
-# ⚠️ chart name 含下划线(cache_aware_router)—— 首次真打 tag 时留意 helm package 是否接受(不接受则把 Chart.yaml
-#   name 改成 cache-aware-router,或依赖 push-chart 内部 sanitize)。本 job 随 monitor 同款机制,机制本身已实测。
-# 消费:helm repo add harbor-chart-repo https://harbor.4pd.io/chartrepo/hardcore-tech && helm upgrade ... --version <chart-ver(去v)>
-build:chart:
-  stage: build
-  tags: [public-buildx]
-  rules:
-    - if: '$CI_COMMIT_TAG'
-  variables:
-    MODULE_NAME: cache_aware_router
-    CHART_FOLDER: k8s/helm
-    REGISTRY_PROJECT: hardcore-tech
-  script:
-    - 'CHART_VER="${CI_COMMIT_TAG#v}"'
-    - 'sed -i -E "s/^version:.*/version: ${CHART_VER}/; s/^appVersion:.*/appVersion: \"${CI_COMMIT_TAG}\"/" "${CHART_FOLDER}/Chart.yaml"'
-    - push-chart
-    - 'echo "chart pushed: cache_aware_router ${CHART_VER} (image ${CI_COMMIT_TAG}) → ChartMuseum(harbor-chart-repo)"'
