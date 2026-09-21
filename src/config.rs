@@ -7,6 +7,7 @@ use std::time::Duration;
 /// Minimal CLI: just the config file path and optional validation flag.
 #[derive(Parser, Debug)]
 #[command(name = "cache-aware-router")]
+#[command(version)]
 #[command(about = "Minimal cache-aware reverse proxy for vLLM services")]
 pub struct CliArgs {
     /// Path to YAML configuration file. Repeatable: files are layered in the

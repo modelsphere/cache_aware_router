@@ -1,6 +1,8 @@
 image:
-  repository: harbor.4pd.io/hardcore-tech/cache_aware_router
-  tag: ""              # 缺省用 Chart.appVersion(v0.6.2)
+  # 公共 registry(Docker Hub 的 4pdosc org),仓外用户开箱可拉。
+  # 内网部署显式覆盖成 harbor.4pd.io/hardcore-tech/cache_aware_router。
+  repository: 4pdosc/cache_aware_router
+  tag: ""              # 缺省用 Chart.appVersion(见 Chart.yaml)
   pullPolicy: IfNotPresent
 
 replicas: 2                # master-standby:2 副本,只有 leader 收流量(单 active 保缓存 + 计数正确)
@@ -14,7 +16,12 @@ waitForWorkers: true
 # CART 有本地 radix 缓存,active-active 会分裂缓存 → 命中率下降;单 active 保持一份热缓存。
 ha:
   enabled: true
-  image: harbor.4pd.io/hardcore-tech/autoconfig-hagate:0.3.31
+  # ⚠️ 这两个 sidecar 镜像来自 autoconfig 仓,不是本仓的产物,版本要跟 autoconfig 的发版走。
+  # 默认值指向公共 registry(Docker Hub 的 4pdosc org),让仓外用户能开箱即用;
+  # 内网部署【必须显式覆盖】成 harbor.4pd.io/hardcore-tech/autoconfig-hagate:<ver>,
+  # 生产集群出不了外网,吃默认值会 ImagePullBackOff —— 而 sidecar 是同 pod 的普通容器,
+  # 拉不到整个 pod 都起不来。详见 reload.image 那里的同款提醒。
+  image: 4pdosc/autoconfig-hagate:0.3.31
   port: 8081
   appTcp: "127.0.0.1:8071"
 
@@ -67,7 +74,8 @@ ulimitNofile: 65535
 
 reload:
   enabled: true
-  image: harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.31
+  # ⚠️ 同 ha.image:来自 autoconfig 仓,默认公共 registry,内网部署必须显式覆盖成 harbor 的。
+  image: 4pdosc/autoconfig-reload:0.3.31
   process: "cache-aware-router"
 
 service:

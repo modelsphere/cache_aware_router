@@ -3,8 +3,18 @@
 # 参考同组 autoconfig/llm-openresty 惯例:org 共享 `public-buildx` runner —— docker daemon 已内置
 # harbor 鉴权,CI 里不需要 docker login、也不需要配 HARBOR_ 变量,直接 docker build + docker push。
 #
-# 镜像多阶段 Rust build(见 Dockerfile):工具链/crates 走 rsproxy.cn(国内镜像,public-buildx runner 可达);
-# 底座/运行镜像都在 harbor。DOCKER_BUILDKIT=0:出简单 v2 manifest,containerd 直接拉(避 buildkit attestation)。
+# 镜像多阶段 Rust build(见 Dockerfile)。Dockerfile 的两个底座是 build arg,【默认值指向 Docker Hub】
+# 供仓外用户直接 docker build;本 runner 到不了 Docker Hub,所以这里必须用 --build-arg 覆盖成 harbor 的。
+#   BUILDER_IMAGE: 预烤好 rust 工具链 + gcc/libssl-dev/ca-certificates + rsproxy cargo 源的构建底座。
+#                  harbor 里【没有】通用的 hardcore-tech/rust,只有这个专用 builder,别改成 rust:x.y。
+#                  仍用 bullseye(glibc 2.31):本 runner 的旧 seccomp profile 挡 clone3,glibc≥2.34
+#                  (bookworm)的 pthread_create 走 clone3 → 建线程 EPERM(cargo/tokio 炸)。
+#                  runner 修好 seccomp 后可换 :1.88(bookworm)。
+#   RUNTIME_IMAGE: 运行底座。二进制走 rustls 不链 openssl(ldd 实测只要 libc/libgcc/libpthread/libm/libdl),
+#                  Dockerfile 只从 builder COPY 出 CA 证书(rustls-native-certs 启动时读),
+#                  所以运行底座不需要装任何包,换成别的 slim 镜像也行。
+#   CARGO_REGISTRY 留空:builder 镜像里已经烤了 rsproxy 的 cargo 源,传空才不会把它覆盖掉。
+# DOCKER_BUILDKIT=0:出简单 v2 manifest,containerd 直接拉(避 buildkit attestation)。
 #
 # 触发:仅打 git tag(如 v0.6.1)。产物 harbor.4pd.io/hardcore-tech/cache_aware_router:<tag> (+ :latest)。
 # 生效前提:本文件要在【被打 tag 的 commit】上(先合进 master),再打 tag。
@@ -14,6 +24,8 @@ stages: [build]
 variables:
   IMAGE: harbor.4pd.io/hardcore-tech/cache_aware_router
   DOCKER_BUILDKIT: "0"
+  BUILDER_IMAGE: harbor.4pd.io/hardcore-tech/cache_aware_router-builder:1.88-bullseye
+  RUNTIME_IMAGE: harbor.4pd.io/sagegpt-aio/pk_platform/ubuntu:24.04
 
 build:image:
   stage: build
@@ -21,7 +33,11 @@ build:image:
   rules:
     - if: '$CI_COMMIT_TAG'          # 只在打 tag 时构建;其它 push 不触发
   script:
-    - docker build -t "$IMAGE:$CI_COMMIT_TAG" -t "$IMAGE:latest" .
+    - >
+      docker build
+      --build-arg "BUILDER_IMAGE=$BUILDER_IMAGE"
+      --build-arg "RUNTIME_IMAGE=$RUNTIME_IMAGE"
+      -t "$IMAGE:$CI_COMMIT_TAG" -t "$IMAGE:latest" .
     - docker push "$IMAGE:$CI_COMMIT_TAG"
     - docker push "$IMAGE:latest"
 
