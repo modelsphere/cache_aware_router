@@ -1,34 +1,51 @@
-# 多阶段:builder = 预烤依赖的 base(cache_aware_router-builder,含 rust + gcc + libssl-dev + ca-cert +
-# rsproxy cargo source),只跑 cargo build → CI 里【完全不碰 apt】,绕开某些 buildx runner 上 apt 验签被
-# 篡改(NO_PUBKEY)+ 大包解压 lzma OOM 的坑(工具链已在干净网络机器上一次性 apt 装好烤进 base)。
+# Both base images are build args, so a build behind a registry mirror (or on a
+# runner that cannot reach Docker Hub) can point them at its own registry.
 #
-# ⚠️ base 用 debian:11(bullseye,glibc 2.31):这些 buildx runner 的旧 seccomp profile 挡 clone3 系统调用,
-#    glibc≥2.34(bookworm)的 pthread_create 走 clone3 → 建线程 EPERM(cargo/tokio 炸);glibc<2.34 走 clone → 放行。
-#    代价:bullseye 是 openssl 1.1,故 runtime 需 COPY libssl.so.1.1(见下)。runner 修好 seccomp 后可换回 bookworm base。
+# Public build — everything from Docker Hub, nothing else needed:
+#   docker build -t cache-aware-router:dev .
 #
-# ⚠️ base 更新(rust 版本/系统依赖变)时在网络干净的机器(如 k8s-cpu-20)上重造并 push:
-#   FROM docker.m.daocloud.io/library/debian:bullseye-slim
-#   RUN apt-get update && apt-get install -y --no-install-recommends curl gcc g++ pkg-config libssl-dev ca-certificates
-#   + rustup(RUSTUP_DIST_SERVER=https://rsproxy.cn)+ cargo source=rsproxy → docker build -t .../cache_aware_router-builder:<tag> && push
+# Behind a slow or restricted network, also pass a crates.io mirror:
+#   docker build --build-arg CARGO_REGISTRY="sparse+https://rsproxy.cn/index/" .
+#
+# See .gitlab-ci.yml for how the internal CI overrides these.
+
+ARG BUILDER_IMAGE=rust:1.88-bookworm
+ARG RUNTIME_IMAGE=debian:12-slim
 
 # ---------- builder ----------
-FROM harbor.4pd.io/hardcore-tech/cache_aware_router-builder:1.88-bullseye AS builder
+FROM ${BUILDER_IMAGE} AS builder
+
+# Optional crates.io mirror. Empty (the default) means crates.io directly, and
+# also leaves any cargo config already baked into a custom builder image alone.
+ARG CARGO_REGISTRY=""
+RUN set -eux; \
+    if [ -n "$CARGO_REGISTRY" ]; then \
+        CH="${CARGO_HOME:-$HOME/.cargo}"; \
+        mkdir -p "$CH"; \
+        printf '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "%s"\n' \
+            "$CARGO_REGISTRY" > "$CH/config.toml"; \
+    fi
+
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --release
+RUN cargo build --release --locked
 
 # ---------- runtime ----------
-FROM harbor.4pd.io/sagegpt-aio/pk_platform/ubuntu:24.04
-# 不用 apt。从 builder COPY:① ca-cert(该 ubuntu base 无,CART reqwest 走 HTTPS 需要);
-# ② openssl 1.1 的 .so(bullseye 编的二进制链 libssl.so.1.1,ubuntu:24.04 只有 .so.3)。
+# No apt here, so the runtime image can come from a registry mirror with no
+# package feed reachable. TLS is rustls (reqwest 0.13), so nothing links OpenSSL
+# — verified with ldd: the binary needs only libgcc/libpthread/libm/libdl/libc.
+# What it does need is the system trust store, because rustls-native-certs reads
+# it at startup; that is copied from the builder.
+FROM ${RUNTIME_IMAGE}
+
 COPY --from=builder /etc/ssl/certs /etc/ssl/certs
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so.1.1 /usr/lib/x86_64-linux-gnu/
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so.1.1 /usr/lib/x86_64-linux-gnu/
-RUN mkdir -p /workspace
+
 WORKDIR /workspace
-COPY --from=builder /src/target/release/cache-aware-router /workspace/cache-aware-router
-COPY config.example.yaml /workspace/config.example.yaml
-COPY launch_service /workspace/launch_service
-RUN chmod +x /workspace/launch_service /workspace/cache-aware-router
+COPY --from=builder /src/target/release/cache-aware-router ./cache-aware-router
+COPY config.example.yaml ./config.example.yaml
+COPY launch_service ./launch_service
+RUN chmod +x ./launch_service ./cache-aware-router
+
+EXPOSE 6700
 ENTRYPOINT ["./launch_service"]

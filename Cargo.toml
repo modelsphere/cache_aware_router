@@ -1,7 +1,15 @@
 [package]
 name = "cache-aware-router"
-version = "0.6.1"
+version = "0.6.4"
 edition = "2021"
+rust-version = "1.88"
+description = "Cache-aware router for LLM inference backends: routes requests to the replica that already holds the longest matching prompt prefix, while keeping load balanced."
+license = "Apache-2.0"
+repository = "https://github.com/project-modelpilot/cache_aware_router"
+homepage = "https://github.com/project-modelpilot/cache_aware_router"
+readme = "README.md"
+keywords = ["llm", "router", "inference", "prefix-cache", "load-balancing"]
+categories = ["network-programming", "web-programming::http-server"]
 
 [[bin]]
 name = "cache-aware-router"
