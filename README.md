@@ -237,12 +237,12 @@ a pass runs long.
 ## Kubernetes
 
 CART is packaged as a Helm chart, published from the
-[helm-charts](https://github.com/project-modelpilot/helm-charts) repository
+[helm-charts](https://github.com/modelsphere/helm-charts) repository
 rather than from here:
 
 ```bash
-helm repo add modelpilot https://project-modelpilot.github.io/helm-charts
-helm install my-cart modelpilot/cart
+helm repo add modelsphere https://modelsphere.github.io/helm-charts
+helm install my-cart modelsphere/cart
 ```
 
 The chart's defaults assume a controller is managing the worker list and
