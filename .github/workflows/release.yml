@@ -1,9 +1,7 @@
 # Public release: a version tag builds the image and pushes it to Docker Hub.
 #
-# The internal image is built separately by .gitlab-ci.yml and goes to harbor.
-# Both build the same Dockerfile; only the base-image build args and the
-# destination registry differ. Every base here already defaults to a public
-# image, so this side passes no overrides.
+# Every base image defaults to a public image, so no build-arg overrides are
+# passed here.
 #
 # amd64 only: this is a Rust build, and an arm64 leg under QEMU costs
       # far more than a second architecture is worth here. Revisit if
