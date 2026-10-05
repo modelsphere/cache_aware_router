@@ -6,8 +6,6 @@
 #
 # Behind a slow or restricted network, also pass a crates.io mirror:
 #   docker build --build-arg CARGO_REGISTRY="sparse+https://rsproxy.cn/index/" .
-#
-# See .gitlab-ci.yml for how the internal CI overrides these.
 
 ARG BUILDER_IMAGE=rust:1.88-bookworm
 ARG RUNTIME_IMAGE=debian:12-slim
