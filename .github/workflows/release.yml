@@ -1,11 +1,20 @@
-# Public release: a version tag builds the image and pushes it to Docker Hub.
+# Public release: a version tag builds the image for linux/amd64 and linux/arm64
+# and pushes it to Docker Hub as one multi-arch tag.
 #
 # Every base image defaults to a public image, so no build-arg overrides are
 # passed here.
 #
-# amd64 only: this is a Rust build, and an arm64 leg under QEMU costs
-      # far more than a second architecture is worth here. Revisit if
-      # anyone actually needs arm64.
+# Each architecture builds natively on its own runner (ubuntu-24.04-arm for
+# arm64): this is a Rust build with C dependencies (aws-lc-sys), which under QEMU
+# takes far longer than the build itself is worth, and cross-compiling would need
+# an aarch64 C toolchain in the Dockerfile. Each job pushes its image by digest;
+# the merge job then puts the version (and latest) tags on a manifest list over
+# both digests.
+#
+# Pull requests run the same two builds with nothing pushed, so an arm64 breakage
+# shows up before a tag does. Every build is smoke-tested on its own runner: the
+# binary's ELF header matches the platform, it prints its version and it accepts
+# config.example.yaml.
 #
 # Credentials come from the organisation secrets DOCKERHUB_USERNAME and
 # DOCKERHUB_TOKEN.
@@ -15,23 +24,130 @@ on:
   push:
     tags:
       - 'v[0-9]*'
+  pull_request:
 
 permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   IMAGE_0: 4pdosc/cache_aware_router
 
 jobs:
   image:
-    name: Build and push
-    runs-on: ubuntu-latest
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    env:
+      PLATFORM: ${{ matrix.platform }}
+      PUSH: ${{ github.event_name == 'push' }}
     steps:
       - name: Clone the code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # Loaded into the runner's docker so the smoke test can run it; the push
+      # below reuses this build's layers.
+      - name: Build cache_aware_router
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: cache-aware-router:smoke
+
+      - name: Smoke test
+        run: |
+          set -eu
+          arch=$(docker image inspect cache-aware-router:smoke --format '{{.Architecture}}')
+          echo "runner $(uname -m), image ${arch}"
+          if [ "$arch" != "${PLATFORM#linux/}" ]; then
+            echo "built ${arch}, wanted ${PLATFORM}" >&2
+            exit 1
+          fi
+          # The image's architecture field only says what the image claims to be. Read the
+          # binary's ELF header too: an amd64 binary inside an arm64 image would still run
+          # on a runner with binfmt emulation installed.
+          cid=$(docker create cache-aware-router:smoke)
+          docker cp "${cid}:/workspace/cache-aware-router" "${RUNNER_TEMP}/car"
+          docker rm "$cid" >/dev/null
+          file "${RUNNER_TEMP}/car"
+          machine=$(readelf -h "${RUNNER_TEMP}/car" | sed -n 's/^ *Machine: *//p')
+          echo "ELF machine: ${machine}"
+          case "${PLATFORM}:${machine}" in
+            linux/amd64:*X86-64*|linux/arm64:AArch64) ;;
+            *) echo "binary is ${machine}, wanted ${PLATFORM}" >&2; exit 1 ;;
+          esac
+          docker run --rm --entrypoint ./cache-aware-router cache-aware-router:smoke --version
+          docker run --rm --entrypoint ./cache-aware-router cache-aware-router:smoke \
+            -c config.example.yaml --config-check
+
+      - name: Log in to Docker Hub
+        if: env.PUSH == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push by digest
+        id: push
+        if: env.PUSH == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE_0 }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export the digest
+        if: env.PUSH == 'true'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -eu
+          mkdir -p "${RUNNER_TEMP}/digests"
+          touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
+          echo "PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
+
+      - name: Upload the digest
+        if: env.PUSH == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digests-${{ env.PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Tag the multi-arch image
+    if: github.event_name == 'push'
+    needs: image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download the digests
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
 
       # latest is what someone gets when they ask for no version in particular,
       # so a prerelease tag (0.1.0-rc1) builds without taking it.
@@ -53,9 +169,6 @@ jobs:
             echo "T_EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
-
       - name: Set up Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
@@ -65,11 +178,19 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push cache_aware_router
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/amd64
-          push: true
-          tags: ${{ steps.tags.outputs.t0 }}
+      - name: Create the manifest list and push the tags
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          TAGS: ${{ steps.tags.outputs.t0 }}
+        run: |
+          set -eu
+          n=$(ls | wc -l)
+          if [ "$n" -ne 2 ]; then
+            echo "expected 2 digests (amd64, arm64), got ${n}" >&2
+            exit 1
+          fi
+          args=""
+          for t in $TAGS; do args="$args -t $t"; done
+          # shellcheck disable=SC2046,SC2086
+          docker buildx imagetools create $args $(printf "${IMAGE_0}@sha256:%s " *)
+          for t in $TAGS; do docker buildx imagetools inspect "$t"; done
