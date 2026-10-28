@@ -1,6 +1,6 @@
 [package]
 name = "cache-aware-router"
-version = "0.6.4"
+version = "0.6.6"
 edition = "2021"
 rust-version = "1.88"
 description = "Cache-aware router for LLM inference backends: routes requests to the replica that already holds the longest matching prompt prefix, while keeping load balanced."
