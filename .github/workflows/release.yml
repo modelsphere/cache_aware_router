@@ -13,7 +13,8 @@
 #
 # Pull requests run the same two builds with nothing pushed, so an arm64 breakage
 # shows up before a tag does. Every build is smoke-tested on its own runner: the
-# binary prints its version and accepts config.example.yaml.
+# binary's ELF header matches the platform, it prints its version and it accepts
+# config.example.yaml.
 #
 # Credentials come from the organisation secrets DOCKERHUB_USERNAME and
 # DOCKERHUB_TOKEN.
@@ -80,6 +81,19 @@ jobs:
             echo "built ${arch}, wanted ${PLATFORM}" >&2
             exit 1
           fi
+          # The image's architecture field only says what the image claims to be. Read the
+          # binary's ELF header too: an amd64 binary inside an arm64 image would still run
+          # on a runner with binfmt emulation installed.
+          cid=$(docker create cache-aware-router:smoke)
+          docker cp "${cid}:/workspace/cache-aware-router" "${RUNNER_TEMP}/car"
+          docker rm "$cid" >/dev/null
+          file "${RUNNER_TEMP}/car"
+          machine=$(readelf -h "${RUNNER_TEMP}/car" | sed -n 's/^ *Machine: *//p')
+          echo "ELF machine: ${machine}"
+          case "${PLATFORM}:${machine}" in
+            linux/amd64:*X86-64*|linux/arm64:AArch64) ;;
+            *) echo "binary is ${machine}, wanted ${PLATFORM}" >&2; exit 1 ;;
+          esac
           docker run --rm --entrypoint ./cache-aware-router cache-aware-router:smoke --version
           docker run --rm --entrypoint ./cache-aware-router cache-aware-router:smoke \
             -c config.example.yaml --config-check
