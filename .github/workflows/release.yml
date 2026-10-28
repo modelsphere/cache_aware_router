@@ -58,6 +58,21 @@ jobs:
         with:
           persist-credentials: false
 
+      # The tag names the image; Cargo.toml's version is what the binary reports from
+      # --version. Nothing tied the two together, and 0.6.5 shipped reporting 0.6.4.
+      # A prerelease tag (v0.6.6-rc1) is a candidate for its core version: compare that.
+      - name: Check the tag matches Cargo.toml
+        if: github.event_name == 'push'
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME#v}"
+          cargo=$(awk '/^\[/{p=($0=="[package]")} p && /^version *=/{gsub(/.*= *"|".*/,""); print; exit}' Cargo.toml)
+          if [ "${tag%%-*}" != "$cargo" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME}, but Cargo.toml version is ${cargo:-<none>}; bump Cargo.toml and Cargo.lock before tagging"
+            exit 1
+          fi
+          echo "tag ${GITHUB_REF_NAME} matches Cargo.toml ${cargo}"
+
       - name: Set up Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
