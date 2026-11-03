@@ -30,6 +30,14 @@ fn str_field<'v>(v: &'v Value, key: &str) -> &'v str {
     v.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
+/// SGLang and older vLLM call it `reasoning_content`; newer vLLM `reasoning`.
+fn reasoning_field(v: &Value) -> &str {
+    v.get("reasoning_content")
+        .and_then(Value::as_str)
+        .or_else(|| v.get("reasoning").and_then(Value::as_str))
+        .unwrap_or("")
+}
+
 fn block_type(v: &Value) -> Option<&str> {
     v.get("type").and_then(Value::as_str)
 }
@@ -384,7 +392,7 @@ pub fn response_to_anthropic(resp: &Value, model: &str, stop_sequences: &[String
     let choice = resp.pointer("/choices/0").unwrap_or(&Value::Null);
     let msg = &choice["message"];
     let mut content = Vec::new();
-    let reasoning = str_field(msg, "reasoning_content");
+    let reasoning = reasoning_field(msg);
     if !reasoning.is_empty() {
         content.push(json!({"type": "thinking", "thinking": reasoning, "signature": ""}));
     }
@@ -541,7 +549,7 @@ impl StreamConverter {
         };
         let delta = &choice["delta"];
 
-        let reasoning = str_field(delta, "reasoning_content");
+        let reasoning = reasoning_field(delta);
         if !reasoning.is_empty() {
             if self.open != Some(Block::Thinking) {
                 self.open_block(
@@ -1055,6 +1063,27 @@ mod tests {
                 "stop_reason": "tool_use", "stop_sequence": null,
                 "usage": {"input_tokens": 170, "output_tokens": 87, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
             })
+        );
+    }
+
+    #[test]
+    fn test_vllm_reasoning_field() {
+        let resp = json!({"id": "x", "choices": [{"message": {"content": "hi", "reasoning_content": null, "reasoning": "think"}, "finish_reason": "stop"}]});
+        let out = response_to_anthropic(&resp, "m", &[]);
+        assert_eq!(
+            out["content"][0],
+            json!({"type": "thinking", "thinking": "think", "signature": ""})
+        );
+
+        let mut conv = StreamConverter::new("m", vec![]);
+        let sse = conv.feed(
+            b"data: {\"id\":\"a\",\"choices\":[{\"delta\":{\"reasoning\":\"hm\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n",
+        );
+        let evs = events(&sse);
+        assert_eq!(evs[1].1["content_block"]["type"], "thinking");
+        assert_eq!(
+            evs[2].1["delta"],
+            json!({"type": "thinking_delta", "thinking": "hm"})
         );
     }
 

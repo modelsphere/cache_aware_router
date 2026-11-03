@@ -15,6 +15,7 @@ use parking_lot::RwLock;
 use serde_json::json;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
+use tracing::warn;
 
 struct ModelsCache {
     bytes: Bytes,
@@ -92,23 +93,42 @@ async fn messages_handler(
         Ok(b) => b,
         Err(e) => return anthropic::error_response(e.status(), &e.body_text()),
     };
-    let req: serde_json::Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(e) => {
-            return anthropic::error_response(
-                StatusCode::BAD_REQUEST,
-                &format!("invalid JSON body: {e}"),
-            )
-        }
+    // Parse and translate in a scope of their own: the raw body and both parsed
+    // trees are freed before forwarding, so only the translated bytes stay
+    // alive while the engine queues and prefills (headers arrive with the
+    // first token).
+    let (translated, model, stop_sequences) = {
+        let req: serde_json::Value = match serde_json::from_slice(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("/v1/messages rejected: invalid JSON body: {e}");
+                return anthropic::error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("invalid JSON body: {e}"),
+                );
+            }
+        };
+        drop(body);
+        let translated = match anthropic::request_to_openai(&req) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("/v1/messages rejected: {e}");
+                return anthropic::error_response(StatusCode::BAD_REQUEST, &e);
+            }
+        };
+        let model = req
+            .get("model")
+            .and_then(|m| m.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let bytes = match serde_json::to_vec(&translated) {
+            Ok(b) => Bytes::from(b),
+            Err(e) => {
+                return anthropic::error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
+            }
+        };
+        (bytes, model, anthropic::stop_sequences(&req))
     };
-    let translated = match anthropic::request_to_openai(&req) {
-        Ok(v) => v,
-        Err(e) => return anthropic::error_response(StatusCode::BAD_REQUEST, &e),
-    };
-    let model = req
-        .get("model")
-        .and_then(|m| m.as_str())
-        .unwrap_or_default();
 
     // The response body gets parsed here, so it must not come back compressed.
     headers.remove(header::ACCEPT_ENCODING);
@@ -123,12 +143,12 @@ async fn messages_handler(
         &router,
         "/v1/chat/completions",
         &reqwest::Method::POST,
-        Bytes::from(translated.to_string()),
+        translated,
         &headers,
         &state.proxy_config,
     )
     .await;
-    anthropic::translate_response(resp, model, anthropic::stop_sequences(&req)).await
+    anthropic::translate_response(resp, &model, stop_sequences).await
 }
 
 async fn fallback_handler(State(state): State<AppState>, request: Request) -> Response {

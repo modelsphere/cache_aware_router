@@ -339,6 +339,9 @@ pub async fn proxy_request(
     }
 
     let request_text = extract_request_text(json_value.as_ref(), path);
+    // Only needed for the two checks above; don't hold the parsed tree while
+    // the engine queues and prefills.
+    drop(json_value);
     let start = Instant::now();
 
     let max_attempts = proxy_config.max_retries + 1;
