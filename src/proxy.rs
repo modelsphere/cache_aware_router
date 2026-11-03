@@ -213,6 +213,16 @@ fn build_forward_headers(original: &HeaderMap) -> HeaderMap {
     headers
 }
 
+/// Framing headers describe the upstream connection, not the body we send:
+/// copying `transfer-encoding: chunked` onto a buffered body makes hyper drop
+/// the response (the client sees an empty reply), and hyper sets both itself.
+fn is_hop_by_hop(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "transfer-encoding" | "content-length" | "connection" | "keep-alive"
+    )
+}
+
 /// Forward a request to a specific worker, handling streaming.
 /// Returns the response and whether it was successful.
 async fn forward_to_worker(
@@ -259,6 +269,9 @@ async fn forward_to_worker(
 
         let mut builder = Response::builder().status(status.as_u16());
         for (name, value) in resp_headers.iter() {
+            if is_hop_by_hop(name.as_str()) {
+                continue;
+            }
             builder = builder.header(name.as_str(), value.as_bytes());
         }
 
@@ -274,6 +287,9 @@ async fn forward_to_worker(
 
         let mut builder = Response::builder().status(status.as_u16());
         for (name, value) in resp_headers.iter() {
+            if is_hop_by_hop(name.as_str()) {
+                continue;
+            }
             builder = builder.header(name.as_str(), value.as_bytes());
         }
 
@@ -714,5 +730,68 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("not permitted"));
+    }
+
+    /// Upstream answers a non-SSE request with `Transfer-Encoding: chunked`
+    /// (uvicorn does); served back through axum, the client must get the body,
+    /// not an empty reply.
+    #[tokio::test]
+    async fn test_chunked_upstream_non_streaming_reaches_client() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = upstream.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await.unwrap();
+            sock.write_all(
+                b"HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\n\
+                  transfer-encoding: chunked\r\n\r\n16\r\n{\"detail\":\"Not Found\"}\r\n0\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        });
+
+        let worker = Arc::new(Worker::new(
+            format!("http://{upstream_addr}"),
+            10,
+            0,
+            crate::config::HealthConfig {
+                endpoint: "/health".to_string(),
+                interval: Duration::from_secs(10),
+                failure_threshold: 3,
+                success_threshold: 1,
+            },
+            crate::circuit_breaker::CircuitBreakerConfig::default(),
+        ));
+        let app = axum::Router::new().route(
+            "/nope",
+            axum::routing::get(move || {
+                let worker = Arc::clone(&worker);
+                async move {
+                    forward_to_worker(
+                        &reqwest::Client::new(),
+                        &worker,
+                        "/nope",
+                        &reqwest::Method::GET,
+                        Bytes::new(),
+                        &HeaderMap::new(),
+                        Duration::from_secs(5),
+                    )
+                    .await
+                    .unwrap_or_else(|s| s.into_response())
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let resp = reqwest::get(format!("http://{addr}/nope"))
+            .await
+            .expect("client must get a response, not an empty reply");
+        assert_eq!(resp.status(), 404);
+        assert_eq!(resp.text().await.unwrap(), r#"{"detail":"Not Found"}"#);
     }
 }

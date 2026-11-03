@@ -190,7 +190,8 @@ Anthropic format (`src/anthropic.rs`). Notes:
 - Tool-use ids are made unique per response and mapped back to the engine's
   own ids on the next request.
 - Server tools (`web_search_*`, …) are dropped; `document` blocks are rejected
-  with `400`. `/v1/messages/count_tokens` is not implemented.
+  with `400`. `/v1/messages/count_tokens` is not translated: it is passed
+  through to the engine (recent SGLang serves it natively).
 - `model` is passed through: point the client at the served model name
   (`ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_*_MODEL`).
 

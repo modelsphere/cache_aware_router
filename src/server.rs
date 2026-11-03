@@ -4,6 +4,7 @@ use crate::proxy;
 use crate::routing::CacheRouter;
 use arc_swap::ArcSwap;
 use axum::body::{Body, Bytes};
+use axum::extract::rejection::BytesRejection;
 use axum::extract::DefaultBodyLimit;
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -84,8 +85,13 @@ async fn completions_handler(
 async fn messages_handler(
     State(state): State<AppState>,
     mut headers: HeaderMap,
-    body: Bytes,
+    body: Result<Bytes, BytesRejection>,
 ) -> Response {
+    // e.g. 413 from max_body_size: keep it in Anthropic error shape.
+    let body = match body {
+        Ok(b) => b,
+        Err(e) => return anthropic::error_response(e.status(), &e.body_text()),
+    };
     let req: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
