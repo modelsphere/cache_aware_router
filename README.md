@@ -71,7 +71,7 @@ The prefix key is built from the request body, per endpoint:
 |---|---|
 | `POST /v1/chat/completions` | the `messages` array, serialized in order |
 | `POST /v1/completions` | the `prompt` field |
-| `POST /v1/messages` (Anthropic-style) | translated to chat-completions first, then keyed like `/v1/chat/completions` |
+| `POST /v1/messages` (Anthropic-style) | `system` + the `messages` array; with `proxy.anthropic_messages_adapter`, translated first and keyed like `/v1/chat/completions` |
 
 Multimodal parts are handled too: remote media URLs can be rejected up front via
 `proxy.remote_media_url_policy` (set it to a 4xx/5xx status to refuse requests
@@ -169,7 +169,7 @@ before it runs out of CPU.
 |---|---|---|
 | POST | `/v1/chat/completions` | proxied, cache-aware routing |
 | POST | `/v1/completions` | proxied, cache-aware routing |
-| POST | `/v1/messages` | translated to `/v1/chat/completions` and back (see below), cache-aware routing |
+| POST | `/v1/messages` | proxied, cache-aware routing; optionally translated to `/v1/chat/completions` (see below) |
 | GET | `/v1/models` | proxied, then **cached for 10 minutes** |
 | GET | `/health` | healthy replica count; `503` when none are healthy |
 | GET | `/workers` | per-replica load, health, circuit-breaker state |
@@ -177,14 +177,16 @@ before it runs out of CPU.
 
 ### `/v1/messages` translation
 
-Backends are assumed to speak only chat-completions, so an Anthropic Messages
-request (e.g. from Claude Code) is rewritten to `/v1/chat/completions`, routed
-like any chat request, and the JSON or SSE response is rewritten back into
-Anthropic format (`src/anthropic.rs`). Notes:
+Off by default: `/v1/messages` is passed through to an engine that serves it
+natively. For engines that speak only chat-completions, set
+`proxy.anthropic_messages_adapter: true` (restart required, like every `proxy` key):
+an Anthropic Messages request (e.g. from Claude Code) is then rewritten to
+`/v1/chat/completions`, routed like any chat request, and the JSON or SSE
+response is rewritten back into Anthropic format (`src/anthropic.rs`). Notes:
 
 - The engine must run with a tool-call parser (and a reasoning parser for
   thinking models), otherwise tool calls come back as plain text.
-- `reasoning_content` becomes `thinking` blocks (empty `signature`), and
+- `reasoning_content` (or vLLM's `reasoning`) becomes `thinking` blocks (empty `signature`), and
   thinking blocks in history are sent back as `reasoning_content`. The
   request's `thinking` parameter is ignored.
 - Tool-use ids are made unique per response and mapped back to the engine's

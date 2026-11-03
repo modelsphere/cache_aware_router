@@ -90,6 +90,9 @@ pub struct ProxySection {
     pub add_routed_peer_header: bool,
     pub max_body_size: usize,
     pub remote_media_url_policy: u16,
+    /// Translate `/v1/messages` (Anthropic) to `/v1/chat/completions` for
+    /// engines without a native Messages endpoint. Off: passed through as-is.
+    pub anthropic_messages_adapter: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -177,6 +180,7 @@ impl Default for ProxySection {
             add_routed_peer_header: false,
             max_body_size: 10 * 1024 * 1024,
             remote_media_url_policy: 200,
+            anthropic_messages_adapter: false,
         }
     }
 }
@@ -226,6 +230,9 @@ pub struct ProxyConfig {
     pub add_routed_peer_header: bool,
     pub max_body_size: usize,
     pub remote_media_url_policy: u16,
+    /// Translate `/v1/messages` (Anthropic) to `/v1/chat/completions` for
+    /// engines without a native Messages endpoint. Off: passed through as-is.
+    pub anthropic_messages_adapter: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -369,6 +376,7 @@ impl AppConfig {
             add_routed_peer_header: self.proxy.add_routed_peer_header,
             max_body_size: self.proxy.max_body_size,
             remote_media_url_policy: self.proxy.remote_media_url_policy,
+            anthropic_messages_adapter: self.proxy.anthropic_messages_adapter,
         }
     }
 

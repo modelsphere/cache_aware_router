@@ -81,13 +81,32 @@ async fn completions_handler(
     .await
 }
 
-/// Engines only speak chat-completions: translate, route as a chat request,
-/// translate the response back.
+/// With `proxy.anthropic_messages_adapter` off, `/v1/messages` is proxied as-is to an
+/// engine that serves it natively. With it on, the request is translated,
+/// routed as a chat request, and the response translated back.
 async fn messages_handler(
     State(state): State<AppState>,
     mut headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
+    if !state.proxy_config.anthropic_messages_adapter {
+        let body = match body {
+            Ok(b) => b,
+            Err(e) => return e.into_response(),
+        };
+        let router = state.router.load();
+        return proxy::proxy_request(
+            &state.client,
+            &router,
+            "/v1/messages",
+            &reqwest::Method::POST,
+            body,
+            &headers,
+            &state.proxy_config,
+        )
+        .await;
+    }
+
     // e.g. 413 from max_body_size: keep it in Anthropic error shape.
     let body = match body {
         Ok(b) => b,
@@ -283,4 +302,92 @@ async fn workers_handler(State(state): State<AppState>) -> impl IntoResponse {
         "workers": workers,
         "total": workers.len(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AppConfig;
+    use crate::worker::Worker;
+    use std::io::Write;
+
+    /// Fake engine: answers every request with a chat completion whose text is
+    /// the path it was called on, so the test sees where CART sent the request.
+    async fn spawn_engine() -> String {
+        let app = Router::new().fallback(|uri: axum::http::Uri| async move {
+            Json(json!({
+                "id": "x",
+                "choices": [{"message": {"content": uri.path()}, "finish_reason": "stop"}],
+            }))
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// `translate: None` leaves the key out, to exercise the default.
+    async fn spawn_cart(engine: &str, translate: Option<bool>) -> String {
+        let mut yaml =
+            format!("workers:\n  - url: \"{engine}\"\ncache:\n  eviction_interval_secs: 0\n");
+        if let Some(t) = translate {
+            yaml.push_str(&format!("proxy:\n  anthropic_messages_adapter: {t}\n"));
+        }
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+        let config = AppConfig::load(&[file.path().to_path_buf()]).unwrap();
+        let workers: Arc<[Arc<Worker>]> = config
+            .workers
+            .iter()
+            .map(|w| {
+                Arc::new(Worker::new(
+                    w.url.clone(),
+                    w.max_load,
+                    w.load_penalty,
+                    config.health_config(),
+                    Default::default(),
+                ))
+            })
+            .collect();
+        let state = AppState {
+            client: reqwest::Client::new(),
+            router: Arc::new(ArcSwap::from_pointee(CacheRouter::new(
+                workers,
+                config.cache_config(),
+            ))),
+            proxy_config: config.proxy_config(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, build_app(state)).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    async fn post_messages(cart: &str) -> serde_json::Value {
+        reqwest::Client::new()
+            .post(format!("{cart}/v1/messages"))
+            .json(&json!({"model": "m", "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_messages_passthrough_by_default() {
+        let cart = spawn_cart(&spawn_engine().await, None).await;
+        let resp = post_messages(&cart).await;
+        // Engine saw /v1/messages, and its reply came back untouched.
+        assert_eq!(resp["choices"][0]["message"]["content"], "/v1/messages");
+    }
+
+    #[tokio::test]
+    async fn test_messages_translated_when_translation_on() {
+        let cart = spawn_cart(&spawn_engine().await, Some(true)).await;
+        let resp = post_messages(&cart).await;
+        assert_eq!(resp["type"], "message");
+        assert_eq!(resp["content"][0]["text"], "/v1/chat/completions");
+    }
 }

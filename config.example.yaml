@@ -56,6 +56,9 @@ proxy:
   max_body_size: 10485760
   # HTTP status code for remote media URLs (200=allow, 4xx/5xx=reject with that code)
   remote_media_url_policy: 200
+  # Translate Anthropic /v1/messages to /v1/chat/completions (and the response
+  # back) for engines that have no native /v1/messages. false = pass through.
+  anthropic_messages_adapter: false
 
 circuit_breaker:
   failure_threshold: 5
