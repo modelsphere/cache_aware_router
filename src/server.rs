@@ -1,3 +1,4 @@
+use crate::anthropic;
 use crate::config::ProxyConfig;
 use crate::proxy;
 use crate::routing::CacheRouter;
@@ -5,7 +6,7 @@ use arc_swap::ArcSwap;
 use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::Router;
@@ -78,22 +79,50 @@ async fn completions_handler(
     .await
 }
 
+/// Engines only speak chat-completions: translate, route as a chat request,
+/// translate the response back.
 async fn messages_handler(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    mut headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let req: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return anthropic::error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("invalid JSON body: {e}"),
+            )
+        }
+    };
+    let translated = match anthropic::request_to_openai(&req) {
+        Ok(v) => v,
+        Err(e) => return anthropic::error_response(StatusCode::BAD_REQUEST, &e),
+    };
+    let model = req
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or_default();
+
+    // The response body gets parsed here, so it must not come back compressed.
+    headers.remove(header::ACCEPT_ENCODING);
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+
     let router = state.router.load();
-    proxy::proxy_request(
+    let resp = proxy::proxy_request(
         &state.client,
         &router,
-        "/v1/messages",
+        "/v1/chat/completions",
         &reqwest::Method::POST,
-        body,
+        Bytes::from(translated.to_string()),
         &headers,
         &state.proxy_config,
     )
-    .await
+    .await;
+    anthropic::translate_response(resp, model, anthropic::stop_sequences(&req)).await
 }
 
 async fn fallback_handler(State(state): State<AppState>, request: Request) -> Response {

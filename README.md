@@ -71,7 +71,7 @@ The prefix key is built from the request body, per endpoint:
 |---|---|
 | `POST /v1/chat/completions` | the `messages` array, serialized in order |
 | `POST /v1/completions` | the `prompt` field |
-| `POST /v1/messages` (Anthropic-style) | `system` + the `messages` array |
+| `POST /v1/messages` (Anthropic-style) | translated to chat-completions first, then keyed like `/v1/chat/completions` |
 
 Multimodal parts are handled too: remote media URLs can be rejected up front via
 `proxy.remote_media_url_policy` (set it to a 4xx/5xx status to refuse requests
@@ -169,11 +169,30 @@ before it runs out of CPU.
 |---|---|---|
 | POST | `/v1/chat/completions` | proxied, cache-aware routing |
 | POST | `/v1/completions` | proxied, cache-aware routing |
-| POST | `/v1/messages` | proxied, cache-aware routing |
+| POST | `/v1/messages` | translated to `/v1/chat/completions` and back (see below), cache-aware routing |
 | GET | `/v1/models` | proxied, then **cached for 10 minutes** |
 | GET | `/health` | healthy replica count; `503` when none are healthy |
 | GET | `/workers` | per-replica load, health, circuit-breaker state |
 | * | anything else | passed through to a replica unchanged |
+
+### `/v1/messages` translation
+
+Backends are assumed to speak only chat-completions, so an Anthropic Messages
+request (e.g. from Claude Code) is rewritten to `/v1/chat/completions`, routed
+like any chat request, and the JSON or SSE response is rewritten back into
+Anthropic format (`src/anthropic.rs`). Notes:
+
+- The engine must run with a tool-call parser (and a reasoning parser for
+  thinking models), otherwise tool calls come back as plain text.
+- `reasoning_content` becomes `thinking` blocks (empty `signature`), and
+  thinking blocks in history are sent back as `reasoning_content`. The
+  request's `thinking` parameter is ignored.
+- Tool-use ids are made unique per response and mapped back to the engine's
+  own ids on the next request.
+- Server tools (`web_search_*`, …) are dropped; `document` blocks are rejected
+  with `400`. `/v1/messages/count_tokens` is not implemented.
+- `model` is passed through: point the client at the served model name
+  (`ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_*_MODEL`).
 
 Streaming (`text/event-stream`) is passed through without buffering, so
 time-to-first-token is unaffected. Set `proxy.add_routed_peer_header: true` to
